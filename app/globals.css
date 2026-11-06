@@ -1,0 +1,56 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+  }
+  button,
+  input,
+  select,
+  textarea {
+    font-family: inherit;
+  }
+  button:focus-visible,
+  a:focus-visible {
+    outline: 2px solid #111111;
+    outline-offset: 2px;
+  }
+}
+
+@layer components {
+  /* Underline that grows in from the left on hover / focus */
+  .link-grow {
+    background-image: linear-gradient(currentColor, currentColor);
+    background-size: 0 1px;
+    background-repeat: no-repeat;
+    background-position: 0 calc(100% - 6px);
+    transition: background-size 0.3s ease;
+  }
+  .link-grow:hover,
+  .link-grow:focus-visible {
+    background-size: 100% 1px;
+  }
+
+  /* Plain text link with a fixed underline */
+  .link-underline {
+    text-decoration: underline;
+    text-underline-offset: 5px;
+    transition: opacity 0.2s ease;
+  }
+  .link-underline:hover {
+    opacity: 0.75;
+  }
+
+  .search-input {
+    border: 0;
+    border-bottom: 1px solid #cfcac3;
+    border-radius: 0;
+    transition: border-color 0.3s ease;
+  }
+  .search-input:focus {
+    outline: none;
+    border-bottom-color: #111111;
+  }
+}

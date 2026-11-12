@@ -1,16 +1,19 @@
 import { clients } from "@/lib/data";
+import { createClient, OAuthStrategy } from "@wix/sdk";
+import { items } from "@wix/data";
+import PortfolioCarousel from "@/components/portfolio-carousel/page";
 
-export default function ClientsStrip() {
+const client = createClient({
+  modules: { items },
+  auth: OAuthStrategy({
+    clientId: process.env.NEXT_PUBLIC_WIX_CLIENT_ID!,
+  }),
+});
+
+export default async function ClientsStrip() {
+  const response = await client.items.query("PortfolioCarousel").find();
+
   return (
-    <section aria-label="In the company of">
-      <div className="mx-auto flex max-w-site flex-wrap items-center justify-center gap-x-9 gap-y-3 border-b border-line-soft px-gutter py-[22px]">
-        <span className="text-[11px] uppercase tracking-[0.08em] text-mute">In the company of</span>
-        {clients.map((c) => (
-          <span key={c} className="text-[13px] uppercase tracking-[0.16em] text-ink-soft">
-            {c}
-          </span>
-        ))}
-      </div>
-    </section>
+      <PortfolioCarousel items={response.items || []} />
   );
 }

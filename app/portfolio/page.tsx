@@ -13,12 +13,6 @@ const client = createClient({
 export default async function PortfolioPage() {
   try {
     const response = await client.items.query("PortfolioCarousel").find();
-    console.log("--- FIRST ITEM KEYS ---");
-    console.log("Root keys:", Object.keys(response.items[0]));
-    if (response.items[0].data) {
-    console.log("Nested data keys:", Object.keys(response.items[0].data));
-    }
-    console.log("Full sample item:", JSON.stringify(response.items[0], null, 2));
 
     return (
       <main>

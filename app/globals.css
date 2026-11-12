@@ -53,4 +53,15 @@
     outline: none;
     border-bottom-color: #111111;
   }
+
+  .portfolio-marquee-track {
+    animation: portfolio-marquee 40s linear infinite;
+    will-change: transform;
+  }
+}
+
+@keyframes portfolio-marquee {
+  to {
+    transform: translateX(-50%);
+  }
 }

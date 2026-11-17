@@ -44,7 +44,7 @@ function resolveWixImage(imgValue: any): string | null {
 
 export default function PortfolioCarousel({
   items,
-  speed = 1,
+  speed = 0,
   hoverSpeedMultiplier = 0.35,
 }: PortfolioCarouselProps) {
   const trackRef = useRef<HTMLDivElement>(null);
@@ -64,7 +64,7 @@ export default function PortfolioCarousel({
       return (
         <div
           key={duplicate ? `${item._id}-duplicate` : item._id}
-          className="w-40 flex-none overflow-hidden text-center"
+          className="flex-none overflow-hidden text-center"
         >
           {/* {imageUrl ? (
             <img

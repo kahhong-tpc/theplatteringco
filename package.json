@@ -9,9 +9,11 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@wix/business-tools": "^1.0.234",
     "@wix/data": "^1.0.541",
     "@wix/ecom": "^1.0.2643",
     "@wix/image-kit": "^1.129.0",
+    "@wix/members": "^1.0.541",
     "@wix/redirects": "^1.0.134",
     "@wix/sdk": "^1.21.18",
     "@wix/stores": "^1.0.997",

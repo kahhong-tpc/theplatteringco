@@ -1,8 +1,11 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { wixClient } from "@/lib/wixClient";
 import { TierRule, PresentationOption } from "@/lib/catering";
+import Step2AddOns, { SelectedAddOn } from "@/components/addon/addon";
+import type { AddOnGroupItem } from "@/lib/wix-addon";
+import { useAuth } from "@/context/AuthContext";
 
 export interface Dish {
   _id: string;
@@ -34,18 +37,26 @@ const DEFAULT_RULE: TierRule = {
   sortOrder: 999,
 };
 
+const STORAGE_KEY = "catering_guest_draft";
+
 export default function CateringBuilder({
   tiers,
   dishes,
   tierRules = {},
   presentations = [],
   addOns = [],
+  addOnGroups = [],
+  categorySlug,
+  drinkMenus = {},
 }: {
   tiers: any[];
   dishes: Dish[];
   tierRules?: Record<string, TierRule>;
   presentations?: PresentationOption[];
   addOns?: AddOnProduct[];
+  addOnGroups?: AddOnGroupItem[];
+  categorySlug?: string;
+  drinkMenus?: Record<string, string[]>;
 }) {
   // Match Store Product name against CMS title (longest-first prevents partial collisions)
   const getRuleForTier = (tier: any): TierRule => {
@@ -57,7 +68,7 @@ export default function CateringBuilder({
     return matchedKey ? tierRules[matchedKey] : DEFAULT_RULE;
   };
 
-  // Calculate dynamic presentation fee based on guest count brackets (e.g., 40:60, 60:100, 80:140, 9999:180)
+  // Calculate dynamic presentation fee based on guest count brackets
   const getPresentationPrice = (
     pres: PresentationOption | undefined,
     guestCount: number
@@ -82,21 +93,39 @@ export default function CateringBuilder({
   const [eventDate, setEventDate] = useState<string>("");
   const [eventTime, setEventTime] = useState<string>("12:00");
 
-  // Step 2 State: Table Styling (from Wix CMS) & Optional Add-Ons
+  // Step 2 State: Table Styling & Nested Add-Ons
   const [selectedPresentationId, setSelectedPresentationId] = useState<string>(
     presentations[0]?._id || ""
   );
+  const [selectedAddOns, setSelectedAddOns] = useState<SelectedAddOn[]>([]);
   const [addOnQuantities, setAddOnQuantities] = useState<Record<string, number>>({});
 
   // Step 3 State: Delivery Address, Contact & Payment Mode
-  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false);
+  // const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false);
   const [contactName, setContactName] = useState<string>("");
   const [contactEmail, setContactEmail] = useState<string>("");
   const [contactPhone, setContactPhone] = useState<string>("");
   const [addressLine1, setAddressLine1] = useState<string>("");
+  const [unitNumber, setUnitNumber] = useState<string>("");
   const [postalCode, setPostalCode] = useState<string>("");
   const [deliveryNotes, setDeliveryNotes] = useState<string>("");
+  const [lookingUpPostal, setLookingUpPostal] = useState<boolean>(false);
+  const [postalError, setPostalError] = useState<string>("");
   const [loading, setLoading] = useState<boolean>(false);
+
+  const { isLoggedIn, member } = useAuth();
+
+  useEffect(() => {
+    if (!member) return;
+    if (!contactName) setContactName(`${member.firstName} ${member.lastName}`.trim());
+    if (!contactEmail) setContactEmail(member.email);
+    if (!contactPhone) setContactPhone(member.phone);
+    if (member.defaultAddress) {
+      if (!postalCode) setPostalCode(member.defaultAddress.postalCode);
+      if (!addressLine1) setAddressLine1(member.defaultAddress.addressLine1);
+      if (!unitNumber) setUnitNumber(member.defaultAddress.unitNumber);
+    }
+  }, [member]);
 
   // Sync default presentation if presentations prop updates
   useEffect(() => {
@@ -105,20 +134,129 @@ export default function CateringBuilder({
     }
   }, [presentations, selectedPresentationId]);
 
-  // Detect Step 4 return from Wix Payment redirect
+  // Unified Mount Effect: Auth check, Step 4 redirect handling, & Step 3 sessionStorage restore
   useEffect(() => {
-    setIsLoggedIn(wixClient.auth.loggedIn());
+    // setIsLoggedIn(wixClient.auth.loggedIn());
 
     const params = new URLSearchParams(window.location.search);
-    if (params.get("step") === "4") {
+    const stepParam = params.get("step");
+
+    if (stepParam === "4") {
+      sessionStorage.removeItem(STORAGE_KEY);
       setStep(4);
       setConfirmedCheckoutId(params.get("checkoutId"));
+      return;
     }
-  }, []);
+
+    const savedDraft = sessionStorage.getItem(STORAGE_KEY);
+    if (savedDraft) {
+      try {
+        const draft = JSON.parse(savedDraft);
+        if (draft.selectedTierId) {
+          const matchedTier = tiers.find((t) => t._id === draft.selectedTierId);
+          if (matchedTier) setSelectedTier(matchedTier);
+        }
+        if (draft.pax) setPax(draft.pax);
+        if (draft.selectedCanapes) setSelectedCanapes(draft.selectedCanapes);
+        if (draft.selectedBeverages) setSelectedBeverages(draft.selectedBeverages);
+        if (draft.selectedPresentationId) setSelectedPresentationId(draft.selectedPresentationId);
+        if (draft.selectedAddOns) setSelectedAddOns(draft.selectedAddOns);
+        if (draft.eventDate) setEventDate(draft.eventDate);
+        if (draft.eventTime) setEventTime(draft.eventTime);
+        if (draft.contactName) setContactName(draft.contactName);
+        if (draft.contactEmail) setContactEmail(draft.contactEmail);
+        if (draft.contactPhone) setContactPhone(draft.contactPhone);
+        if (draft.postalCode) setPostalCode(draft.postalCode);
+        if (draft.addressLine1) setAddressLine1(draft.addressLine1);
+        if (draft.unitNumber) setUnitNumber(draft.unitNumber);
+        if (draft.deliveryNotes) setDeliveryNotes(draft.deliveryNotes);
+      } catch {
+        sessionStorage.removeItem(STORAGE_KEY);
+      }
+    }
+
+    if (stepParam === "3") {
+      setStep(3);
+    }
+  }, [tiers]);
+
+  // Singapore 6-Digit Postal Code Lookup
+  useEffect(() => {
+    const cleaned = postalCode.replace(/\D/g, "");
+    if (cleaned.length !== 6) {
+      setPostalError("");
+      return;
+    }
+
+    const controller = new AbortController();
+
+    async function lookupSingaporePostal() {
+      setLookingUpPostal(true);
+      setPostalError("");
+
+      try {
+        const res = await fetch(`/api/postcode?postal=${cleaned}`, {
+          signal: controller.signal,
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+          setPostalError(data.error || "Postal code not found.");
+          return;
+        }
+
+        if (data.streetAddress) {
+          setAddressLine1(data.streetAddress);
+        }
+      } catch (err: any) {
+        if (err.name !== "AbortError") {
+          setPostalError("Could not auto-fill address. Please enter manually.");
+        }
+      } finally {
+        setLookingUpPostal(false);
+      }
+    }
+
+    lookupSingaporePostal();
+    return () => controller.abort();
+  }, [postalCode]);
+
+  // Resolve Detailed Selected Add-Ons (from CMS AddOnGroups / AddOnOptions)
+  const resolvedSelectedAddOns = useMemo(() => {
+    return selectedAddOns
+      .map((sel) => {
+        const group = addOnGroups.find((g) =>
+          g.options.some((o) => o._id === sel.optionId)
+        );
+        const option = group?.options.find((o) => o._id === sel.optionId);
+        if (!group || !option) return null;
+
+        const lineTotal =
+          option.pricingType === "per_pax"
+            ? option.price * pax
+            : option.price * sel.quantity;
+
+        const pickedDetails = Object.entries(sel.pickedItems || {})
+          .filter(([, list]) => list.length > 0)
+          .map(([key, list]) => `${key}: ${list.join(", ")}`)
+          .join(" | ");
+
+        return {
+          ...sel,
+          groupTitle: group.title,
+          optionTitle: option.title,
+          pricingType: option.pricingType,
+          unitPrice: option.price,
+          lineTotal,
+          pickedDetails,
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => item !== null);
+  }, [selectedAddOns, addOnGroups, pax]);
 
   if (!tiers || tiers.length === 0) {
     return (
-      <div className="mx-auto max-w-4xl p-6 text-center text-gray-500">
+      <div className="mx-auto max-w-6xl p-6 text-center text-gray-500">
         No catering packages found. Check that your products are visible in Wix Stores.
       </div>
     );
@@ -138,9 +276,6 @@ export default function CateringBuilder({
   const beverageList = normalizedDishes.filter((d) => d.category.toLowerCase() === "beverage");
 
   // Strict Backward-Only Step Navigation
-  // - On Step 2: can only go back to Step 1
-  // - On Step 3: can go back to Step 1 or Step 2
-  // - On Step 4 (Confirmation): locked (order completed)
   const canNavigateToStep = (targetStep: 1 | 2 | 3 | 4): boolean => {
     if (step === 4) return false;
     return targetStep < step;
@@ -148,10 +283,26 @@ export default function CateringBuilder({
 
   const handleTierChange = (tier: any) => {
     const nextRules = getRuleForTier(tier);
+    const nextTierCats: string[] = tier?.collectionIds || [];
+
     setSelectedTier(tier);
     setSelectedCanapes([]);
     setSelectedBeverages([]);
     setPax(nextRules.minPax);
+
+    // Strip any previously selected add-ons that aren't allowed for the new tier's categories
+    setSelectedAddOns((prev) =>
+      prev.filter((sel) => {
+        const group = addOnGroups.find((g) => g.options.some((o) => o._id === sel.optionId));
+        if (!group) return false;
+        if (group.applicableCategoryIds.length === 0) return true;
+        return group.applicableCategoryIds.some(
+          (catId) =>
+            nextTierCats.includes(catId) ||
+            (categorySlug && catId.toLowerCase() === categorySlug.toLowerCase())
+        );
+      })
+    );
 
     if (eventTime < nextRules.startTime || eventTime > nextRules.endTime) {
       setEventTime(nextRules.startTime);
@@ -197,51 +348,7 @@ export default function CateringBuilder({
     presentations.find((p) => p._id === selectedPresentationId) || presentations[0];
   const isStep2Complete = presentations.length === 0 || Boolean(activePresentation);
 
-  // Step 3 Validation (Address & Contact)
-  const [unitNumber, setUnitNumber] = useState<string>("");
-  const [lookingUpPostal, setLookingUpPostal] = useState<boolean>(false);
-  const [postalError, setPostalError] = useState<string>("");
-
-  useEffect(() => {
-    const cleaned = postalCode.replace(/\D/g, "");
-    if (cleaned.length !== 6) {
-      setPostalError("");
-      return;
-    }
-
-    const controller = new AbortController();
-
-    async function lookupSingaporePostal() {
-      setLookingUpPostal(true);
-      setPostalError("");
-
-      try {
-        const res = await fetch(`/api/postcode?postal=${cleaned}`, {
-          signal: controller.signal,
-        });
-        const data = await res.json();
-
-        if (!res.ok) {
-          setPostalError(data.error || "Postal code not found.");
-          return;
-        }
-
-        if (data.streetAddress) {
-          setAddressLine1(data.streetAddress);
-        }
-      } catch (err: any) {
-        if (err.name !== "AbortError") {
-          setPostalError("Could not auto-fill address. Please enter manually.");
-        }
-      } finally {
-        setLookingUpPostal(false);
-      }
-    }
-
-    lookupSingaporePostal();
-    return () => controller.abort();
-  }, [postalCode]);
-
+  // Step 3 Validation
   const isStep3AddressValid =
     contactName.trim().length > 0 &&
     contactEmail.includes("@") &&
@@ -254,7 +361,7 @@ export default function CateringBuilder({
   const packageSubtotal = baseUnitPrice * pax;
   const presentationPrice = getPresentationPrice(activePresentation, pax);
 
-  const activeAddOns = addOns
+  const legacyActiveAddOns = addOns
     .filter((item) => (addOnQuantities[item._id] || 0) > 0)
     .map((item) => ({
       ...item,
@@ -262,8 +369,10 @@ export default function CateringBuilder({
       lineTotal: item.price * addOnQuantities[item._id],
     }));
 
-  const addOnsSubtotal = activeAddOns.reduce((sum, item) => sum + item.lineTotal, 0);
-  const grandTotal = packageSubtotal + presentationPrice + addOnsSubtotal;
+  const legacyAddOnsSubtotal = legacyActiveAddOns.reduce((sum, item) => sum + item.lineTotal, 0);
+  const cmsAddOnsSubtotal = resolvedSelectedAddOns.reduce((sum, item) => sum + item.lineTotal, 0);
+  const grandTotal =
+    packageSubtotal + presentationPrice + legacyAddOnsSubtotal + cmsAddOnsSubtotal;
 
   // Step 3 -> Step 4: Create Direct Checkout & Redirect to Wix Payment
   const handleProceedToPayment = async (asGuest: boolean) => {
@@ -282,7 +391,15 @@ export default function CateringBuilder({
         return;
       }
 
-      // 2. Format catering details for the Store product modifier
+      // 2. Format catering & add-on details for the Store product modifier
+      const formattedAddOns = resolvedSelectedAddOns
+        .map((item) =>
+          item.pickedDetails
+            ? `${item.groupTitle} - ${item.optionTitle} (${item.pickedDetails})`
+            : `${item.groupTitle} - ${item.optionTitle}`
+        )
+        .join("; ");
+
       const formattedDetails = [
         `Date: ${eventDate} @ ${eventTime}`,
         activePresentation
@@ -290,6 +407,7 @@ export default function CateringBuilder({
           : "",
         `Canapes: ${selectedCanapes.join(", ")}`,
         `Beverages: ${selectedBeverages.join(", ")}`,
+        formattedAddOns ? `Add-Ons: ${formattedAddOns}` : "",
         deliveryNotes ? `Notes: ${deliveryNotes}` : "",
       ]
         .filter(Boolean)
@@ -326,8 +444,8 @@ export default function CateringBuilder({
         });
       }
 
-      // 4. Add any optional Add-On products
-      activeAddOns.forEach((addOn) => {
+      // 4. Add any legacy Store Product Add-Ons
+      legacyActiveAddOns.forEach((addOn) => {
         lineItems.push({
           catalogReference: {
             appId: "215238eb-22a5-4c36-9e7b-e7c08025e04e",
@@ -344,20 +462,7 @@ export default function CateringBuilder({
         .filter(Boolean)
         .join(", ");
 
-      const addressPayload = {
-        contactDetails: {
-          firstName,
-          lastName,
-          phone: contactPhone.trim(),
-        },
-        address: {
-          addressLine1: fullStreetAddress,
-          postalCode: postalCode.trim(),
-          country: "SG",
-        },
-      };
-
-      // 5. Create isolated checkout directly (bypasses currentCart completely)
+      // 5. Create isolated checkout directly
       const createdCart = await wixClient.cartV2.createCart({
         catalogItems: lineItems,
         cart: {
@@ -388,14 +493,46 @@ export default function CateringBuilder({
         throw new Error("Failed to create Cart V2.");
       }
 
-      // 2. Pass the Cart V2 `_id` into `ecomCheckout.checkoutId`
       const returnUrl = new URL(window.location.href);
       returnUrl.searchParams.set("step", "4");
       returnUrl.searchParams.set("checkoutId", createdCart._id);
 
+      // Save current selections before leaving Next.js
+      sessionStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify({
+          selectedTierId: selectedTier._id,
+          pax,
+          selectedCanapes,
+          selectedBeverages,
+          selectedPresentationId,
+          selectedAddOns,
+          eventDate,
+          eventTime,
+          contactName,
+          contactEmail,
+          contactPhone,
+          postalCode,
+          addressLine1,
+          unitNumber,
+          deliveryNotes,
+        })
+      );
+
+      // Success URL -> Step 4
+      const successUrl = new URL(window.location.origin + window.location.pathname);
+      successUrl.searchParams.set("step", "4");
+      successUrl.searchParams.set("checkoutId", createdCart._id);
+
+      // Cancel / Back URL -> Step 3
+      const cancelUrl = new URL(window.location.origin + window.location.pathname);
+      cancelUrl.searchParams.set("step", "3");
+
       const { redirectSession } = await wixClient.redirects.createRedirectSession({
         ecomCheckout: { checkoutId: createdCart._id },
         callbacks: {
+          thankYouPageUrl: successUrl.toString(),
+          // postFlowUrl: cancelUrl.toString(),
           postFlowUrl: returnUrl.toString(),
         },
       });
@@ -418,7 +555,7 @@ export default function CateringBuilder({
   ];
 
   return (
-    <div className="mx-auto max-w-4xl space-y-8 p-6">
+    <div className="mx-auto max-w-6xl space-y-8 p-6">
       {/* 4-Step Progress Bar (Backward-Only Clickable) */}
       <nav aria-label="Progress" className="border-b border-gray-200 pb-4">
         <ol className="grid grid-cols-2 gap-2 text-sm font-medium sm:grid-cols-4">
@@ -454,7 +591,11 @@ export default function CateringBuilder({
       {/* =========================================================
           STEP 1: PACKAGE TIER, DISHES, PAX & EVENT DATE/TIME
       ========================================================= */}
-      {step === 1 && (
+      {step !== 4 ? (
+        <div className="grid grid-cols-1 items-start gap-8 lg:grid-cols-12">
+          {/* LEFT COLUMN: Active Step Form (8 of 12 cols on desktop) */}
+          <div className="space-y-8 lg:col-span-8">
+            {step === 1 && (
         <div className="space-y-8">
           <section>
             <h2 className="mb-3 text-xl font-bold">Choose Your Package Tier</h2>
@@ -567,7 +708,7 @@ export default function CateringBuilder({
             </div>
           </section>
 
-          <section className="flex flex-col justify-between gap-6 rounded-xl bg-gray-50 p-6 sm:flex-row sm:items-end">
+          {/* <section className="flex flex-col justify-between gap-6 rounded-xl bg-gray-50 p-6 sm:flex-row sm:items-end">
             <div className="flex flex-wrap gap-4">
               <div>
                 <label className="block text-sm font-medium text-gray-700">
@@ -641,7 +782,7 @@ export default function CateringBuilder({
                     } drink(s)`}
               </button>
             </div>
-          </section>
+          </section> */}
         </div>
       )}
 
@@ -716,7 +857,17 @@ export default function CateringBuilder({
               Enhance your event with extra service staff, equipment, or beverage upgrades.
             </p>
 
-            {addOns.length === 0 ? (
+            {addOnGroups.length > 0 ? (
+              <Step2AddOns
+                addOnGroups={addOnGroups}
+                selectedTierCollectionIds={selectedTier?.collectionIds || []}
+                currentCategorySlug={categorySlug}
+                pax={pax}
+                selectedAddOns={selectedAddOns}
+                onChangeSelectedAddOns={setSelectedAddOns}
+                drinkMenus={drinkMenus}
+              />
+            ) : addOns.length === 0 ? (
               <div className="rounded-xl border border-dashed border-gray-200 p-6 text-center text-sm text-gray-500">
                 No optional add-ons available for this menu.
               </div>
@@ -841,53 +992,51 @@ export default function CateringBuilder({
               </div>
 
               <div>
-              <label className="block text-sm font-medium text-gray-700">
-                Postal Code *{" "}
-                {lookingUpPostal && (
-                  <span className="ml-1 text-xs font-normal text-gray-500">Looking up...</span>
-                )}
-              </label>
-              <input
-                type="text"
-                inputMode="numeric"
-                maxLength={6}
-                required
-                placeholder="018956"
-                value={postalCode}
-                onChange={(e) => setPostalCode(e.target.value.replace(/\D/g, ""))}
-                className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
-              />
-              {postalError && <p className="mt-1 text-xs text-red-600">{postalError}</p>}
-            </div>
+                <label className="block text-sm font-medium text-gray-700">
+                  Postal Code *{" "}
+                  {lookingUpPostal && (
+                    <span className="ml-1 text-xs font-normal text-gray-500">Looking up...</span>
+                  )}
+                </label>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  maxLength={6}
+                  required
+                  placeholder="018956"
+                  value={postalCode}
+                  onChange={(e) => setPostalCode(e.target.value.replace(/\D/g, ""))}
+                  className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+                />
+                {postalError && <p className="mt-1 text-xs text-red-600">{postalError}</p>}
+              </div>
 
-            {/* Unit / Floor Number (user fills in manually) */}
-            <div>
-              <label className="block text-sm font-medium text-gray-700">
-                Unit / Floor (Optional)
-              </label>
-              <input
-                type="text"
-                placeholder="#12-01"
-                value={unitNumber}
-                onChange={(e) => setUnitNumber(e.target.value)}
-                className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
-              />
-            </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700">
+                  Unit / Floor (Optional)
+                </label>
+                <input
+                  type="text"
+                  placeholder="#12-01"
+                  value={unitNumber}
+                  onChange={(e) => setUnitNumber(e.target.value)}
+                  className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+                />
+              </div>
 
-            {/* Auto-Filled Street & Building Address (still editable by user) */}
-            <div className="sm:col-span-2">
-              <label className="block text-sm font-medium text-gray-700">
-                Street & Building Address *
-              </label>
-              <input
-                type="text"
-                required
-                placeholder="Auto-fills from postal code (or type manually)"
-                value={addressLine1}
-                onChange={(e) => setAddressLine1(e.target.value)}
-                className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
-              />
-            </div>
+              <div className="sm:col-span-2">
+                <label className="block text-sm font-medium text-gray-700">
+                  Street & Building Address *
+                </label>
+                <input
+                  type="text"
+                  required
+                  placeholder="Auto-fills from postal code (or type manually)"
+                  value={addressLine1}
+                  onChange={(e) => setAddressLine1(e.target.value)}
+                  className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+                />
+              </div>
 
               <div className="sm:col-span-2">
                 <label className="block text-sm font-medium text-gray-700">
@@ -950,7 +1099,17 @@ export default function CateringBuilder({
                   </dd>
                 </div>
               )}
-              {activeAddOns.map((item) => (
+              {resolvedSelectedAddOns.map((item) => (
+                <div key={item.optionId} className="flex justify-between">
+                  <dt className="text-gray-500">
+                    {item.groupTitle} – {item.optionTitle}
+                    {item.pickedDetails ? ` (${item.pickedDetails})` : ""}
+                    {item.pricingType === "per_pax" ? ` (${pax} pax)` : ""}
+                  </dt>
+                  <dd className="font-medium">${item.lineTotal.toFixed(2)}</dd>
+                </div>
+              ))}
+              {legacyActiveAddOns.map((item) => (
                 <div key={item._id} className="flex justify-between">
                   <dt className="text-gray-500">
                     {item.name} × {item.quantity}
@@ -1024,40 +1183,288 @@ export default function CateringBuilder({
           </section>
         </div>
       )}
-
-      {/* =========================================================
-          STEP 4: CONFIRMATION (LOCKED — NO BACKWARD NAVIGATION)
-      ========================================================= */}
-      {step === 4 && (
-        <section className="rounded-2xl border border-emerald-200 bg-emerald-50/50 p-8 text-center">
-          <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-emerald-600 text-2xl font-bold text-white">
-            ✓
           </div>
-          <h2 className="mt-4 text-2xl font-bold text-gray-900">
-            Catering Booking Confirmed
-          </h2>
-          <p className="mx-auto mt-2 max-w-md text-sm text-gray-600">
-            Thank you! Your catering order has been received and a confirmation email with your
-            event schedule has been sent.
-          </p>
 
-          {confirmedCheckoutId && (
-            <div className="mt-4 inline-block rounded-lg border border-gray-200 bg-white px-4 py-2 text-xs text-gray-600">
-              Booking Reference:{" "}
-              <span className="font-mono font-semibold text-black">{confirmedCheckoutId}</span>
+          {/* RIGHT COLUMN: Sticky Cart / Order Summary (4 of 12 cols on desktop) */}
+          <aside className="lg:col-span-4 lg:sticky lg:top-6">
+            <div className="rounded-2xl border border-gray-200 bg-white p-6 shadow-sm">
+              <div className="flex items-center justify-between border-b border-gray-100 pb-3">
+                <h2 className="text-lg font-bold text-gray-900">Your Catering Summary</h2>
+                <span className="rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-semibold text-gray-700">
+                  {pax} pax
+                </span>
+              </div>
+
+              {step === 1 && (
+                <div className="flex flex-row flex-wrap gap-4 mt-4">
+                  <div className="w-full">
+                    <label className="block text-sm font-medium text-gray-700">
+                      Guests ({rules.minPax}–{rules.maxPax})
+                    </label>
+                    <input
+                      type="number"
+                      min={rules.minPax}
+                      max={rules.maxPax}
+                      value={pax}
+                      onChange={(e) => setPax(Number(e.target.value))}
+                      className="mt-1 w-full rounded-lg border border-gray-300 bg-white px-3 py-2 font-semibold"
+                    />
+                    {!isValidPax && (
+                      <p className="mt-1 text-xs text-red-600">
+                        {rules.minPax}–{rules.maxPax} pax required.
+                      </p>
+                    )}
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700">Event Date *</label>
+                    <input
+                      type="date"
+                      value={eventDate}
+                      onChange={(e) => setEventDate(e.target.value)}
+                      className="mt-1 rounded-lg border border-gray-300 bg-white px-3 py-2 font-semibold"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700">
+                      Start Time ({rules.startTime}–{rules.endTime})
+                    </label>
+                    <input
+                      type="time"
+                      min={rules.startTime}
+                      max={rules.endTime}
+                      value={eventTime}
+                      onChange={(e) => setEventTime(e.target.value)}
+                      className="mt-1 w-32 rounded-lg border border-gray-300 bg-white px-3 py-2 font-semibold"
+                    />
+                    {!isValidTime && (
+                      <p className="mt-1 text-xs text-red-600">
+                        {rules.startTime}–{rules.endTime} only.
+                      </p>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              <div className="mt-4 space-y-4 text-sm">
+                {/* 1. Selected Package Tier */}
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <p className="font-semibold text-gray-900">
+                      {selectedTier?.name?.split("–")[0].trim()}
+                    </p>
+                    <p className="text-xs text-gray-500">
+                      ${baseUnitPrice.toFixed(2)} × {pax} guests
+                    </p>
+                  </div>
+                  <span className="font-semibold text-gray-900">
+                    ${packageSubtotal.toFixed(2)}
+                  </span>
+                </div>
+
+                {/* 2. Event Schedule */}
+                <div className="rounded-lg bg-gray-50 p-3 text-xs text-gray-600 space-y-1">
+                  <div className="flex justify-between">
+                    <span className="text-gray-500">Event Date:</span>
+                    <span className="font-medium text-gray-900">
+                      {eventDate || "Not selected yet"}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-gray-500">Start Time:</span>
+                    <span className="font-medium text-gray-900">{eventTime}</span>
+                  </div>
+                </div>
+
+                {/* 3. Selected Menu Dishes (Canapés & Beverages) */}
+                {(selectedCanapes.length > 0 || selectedBeverages.length > 0) && (
+                  <div className="border-t border-gray-100 pt-3 space-y-2">
+                    {selectedCanapes.length > 0 && (
+                      <div>
+                        <p className="text-xs font-semibold uppercase tracking-wider text-gray-400">
+                          Canapés ({selectedCanapes.length}/{rules.limitProduct})
+                        </p>
+                        <ul className="mt-1 space-y-0.5 text-xs text-gray-700">
+                          {selectedCanapes.map((c) => (
+                            <li key={c}>• {c}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+
+                    {selectedBeverages.length > 0 && (
+                      <div>
+                        <p className="text-xs font-semibold uppercase tracking-wider text-gray-400">
+                          Beverages ({selectedBeverages.length}/{rules.beverages})
+                        </p>
+                        <ul className="mt-1 space-y-0.5 text-xs text-gray-700">
+                          {selectedBeverages.map((b) => (
+                            <li key={b}>• {b}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* 4. Table Presentation */}
+                {activePresentation && (
+                  <div className="border-t border-gray-100 pt-3 flex items-start justify-between gap-2">
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-wider text-gray-400">
+                        Presentation
+                      </p>
+                      <p className="mt-0.5 text-xs font-medium text-gray-800">
+                        {activePresentation.title}
+                      </p>
+                    </div>
+                    <span className="text-xs font-semibold text-gray-900">
+                      {presentationPrice === 0
+                        ? "Free"
+                        : `$${presentationPrice.toFixed(2)}`}
+                    </span>
+                  </div>
+                )}
+
+                {/* 5. Optional Add-Ons (Bar, Table, Refreshments) */}
+                {(resolvedSelectedAddOns.length > 0 || legacyActiveAddOns.length > 0) && (
+                  <div className="border-t border-gray-100 pt-3 space-y-2">
+                    <p className="text-xs font-semibold uppercase tracking-wider text-gray-400">
+                      Add-Ons
+                    </p>
+                    {resolvedSelectedAddOns.map((item) => (
+                      <div key={item.optionId} className="space-y-0.5">
+                        <div className="flex items-start justify-between gap-2 text-xs">
+                          <span className="font-medium text-gray-800">
+                            {item.optionTitle}
+                            {item.quantity > 1 ? ` × ${item.quantity}` : ""}
+                            {item.pricingType === "per_pax" ? ` (${pax} pax)` : ""}
+                          </span>
+                          <span className="font-semibold text-gray-900">
+                            ${item.lineTotal.toFixed(2)}
+                          </span>
+                        </div>
+                        {item.pickedDetails && (
+                          <p className="text-[11px] text-gray-500 pl-2 border-l-2 border-gray-200">
+                            {item.pickedDetails}
+                          </p>
+                        )}
+                      </div>
+                    ))}
+
+                    {legacyActiveAddOns.map((item) => (
+                      <div
+                        key={item._id}
+                        className="flex items-start justify-between gap-2 text-xs"
+                      >
+                        <span className="font-medium text-gray-800">
+                          {item.name} × {item.quantity}
+                        </span>
+                        <span className="font-semibold text-gray-900">
+                          ${item.lineTotal.toFixed(2)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* 6. Grand Total */}
+                <div className="border-t border-gray-200 pt-4">
+                  <div className="flex items-baseline justify-between">
+                    <span className="text-sm font-bold text-gray-900">Estimated Total</span>
+                    <span className="text-xl font-extrabold text-black">
+                      ${grandTotal.toFixed(2)}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-[11px] text-gray-400">
+                    Step {step} of 3 • Updates live as you customize
+                  </p>
+                </div>
+
+                {/* Quick Step CTA inside Sidebar */}
+                {step === 1 && (
+                  // <button
+                  //   type="button"
+                  //   disabled={!isStep1Complete}
+                  //   onClick={() => setStep(2)}
+                  //   className="w-full cursor-pointer rounded-lg bg-black py-2.5 text-xs font-semibold text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:bg-gray-300"
+                  // >
+                  //   {isStep1Complete
+                  //     ? "Continue to Step 2 →"
+                  //     : "Complete Menu & Date to Continue"}
+                  // </button>
+                  <button
+                type="button"
+                disabled={!isStep1Complete}
+                onClick={() => setStep(2)}
+                className="mt-2 cursor-pointer rounded-lg bg-black px-6 py-3 font-semibold text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:bg-gray-300"
+              >
+                {isStep1Complete
+                  ? "Next: Presentation & Add-Ons →"
+                  : !eventDate
+                  ? "Select Event Date"
+                  : `Pick ${rules.limitProduct - selectedCanapes.length} canapé(s) & ${
+                      rules.beverages - selectedBeverages.length
+                    } drink(s)`}
+              </button>
+                )}
+
+                {step === 2 && (
+                  <button
+                    type="button"
+                    disabled={!isStep2Complete}
+                    onClick={() => setStep(3)}
+                    className="w-full cursor-pointer rounded-lg bg-black py-2.5 text-xs font-semibold text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:bg-gray-300"
+                  >
+                    Continue to Address &amp; Payment →
+                  </button>
+                )}
+              </div>
             </div>
-          )}
+          </aside>
+        </div>
+      ) : (
+        /* =========================================================
+            STEP 4: CONFIRMATION (Centered Full-Width Card)
+        ========================================================= */
+        <div className="mx-auto max-w-2xl">
+          {/* =========================================================
+              STEP 4: CONFIRMATION (LOCKED — NO BACKWARD NAVIGATION)
+          ========================================================= */}
+          {step === 4 && (
+            <section className="rounded-2xl border border-emerald-200 bg-emerald-50/50 p-8 text-center">
+              <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-emerald-600 text-2xl font-bold text-white">
+                ✓
+              </div>
+              <h2 className="mt-4 text-2xl font-bold text-gray-900">
+                Catering Booking Confirmed
+              </h2>
+              <p className="mx-auto mt-2 max-w-md text-sm text-gray-600">
+                Thank you! Your catering order has been received and a confirmation email with your
+                event schedule has been sent.
+              </p>
 
-          <div className="mt-8 flex justify-center gap-3">
-            <a
-              href="/catering"
-              className="rounded-lg bg-black px-6 py-3 text-sm font-semibold text-white transition hover:bg-gray-800"
-            >
-              Back to Catering Menus
-            </a>
-          </div>
-        </section>
+              {confirmedCheckoutId && (
+                <div className="mt-4 inline-block rounded-lg border border-gray-200 bg-white px-4 py-2 text-xs text-gray-600">
+                  Booking Reference:{" "}
+                  <span className="font-mono font-semibold text-black">{confirmedCheckoutId}</span>
+                </div>
+              )}
+
+              <div className="mt-8 flex justify-center gap-3">
+                <a
+                  href="/catering"
+                  className="rounded-lg bg-black px-6 py-3 text-sm font-semibold text-white transition hover:bg-gray-800"
+                >
+                  Back to Catering Menus
+                </a>
+              </div>
+            </section>
+          )}
+        </div>
       )}
+      
     </div>
   );
 }

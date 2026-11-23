@@ -3,8 +3,8 @@ import { notFound } from "next/navigation";
 import { getCateringMenuBySlug } from "@/lib/catering";
 import CateringBuilder from "@/components/products/CateringBuilder";
 import Hero from "@/components/home/Hero";
-
-export const revalidate = 60;
+import { getServerWixClient } from "@/lib/wixClientServer";
+import { fetchCateringAddOns, fetchAddOnDrinks } from "@/lib/wix-addon";
 
 // Map each Wix Category slug to its corresponding Wix CMS Dish collection
 const DISH_COLLECTION_BY_SLUG: Record<string, string> = {
@@ -19,8 +19,13 @@ export default async function DynamicCateringMenuPage({
 }) {
   const { slug } = await params;
   const dishCollection = DISH_COLLECTION_BY_SLUG[slug] || "CanapeDishes";
+  const serverWixClient = await getServerWixClient();
 
-  const data = await getCateringMenuBySlug(slug, dishCollection);
+  const [data, addOnGroups, drinkMenus] = await Promise.all([
+    getCateringMenuBySlug(slug, dishCollection, "CateringTiers", "CateringPresentations", serverWixClient),
+    fetchCateringAddOns(serverWixClient),
+    fetchAddOnDrinks(serverWixClient),
+  ]);
 
   if (!data) {
     notFound();
@@ -50,6 +55,9 @@ export default async function DynamicCateringMenuPage({
         dishes={data.dishes}
         tierRules={data.tierRules}
         presentations={data.presentations}
+        addOnGroups={addOnGroups}
+        drinkMenus={drinkMenus}
+        categorySlug={slug}
       />
     </main>
   );

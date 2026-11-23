@@ -164,7 +164,7 @@ export const splitTiles: SplitTile[] = [
     title: "Hosted",
     line: "Set up, styled and served by our team.",
     cta: "Shop Now",
-    href: "/canapes",
+    href: "/catering",
     img: "/images/hosted.jpg",
     alt: "The attendant placing a gold cage over canapés on a white-linen buffet with blue hydrangeas, in a wood-panelled room",
   },

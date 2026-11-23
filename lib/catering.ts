@@ -1,4 +1,5 @@
 import { wixClient } from "@/lib/wixClient";
+import { getServerWixClient } from "@/lib/wixClientServer";
 
 export interface TierRule {
   limitProduct: number;
@@ -59,7 +60,8 @@ function parsePriceTiers(raw?: string): PresentationPriceTier[] {
 /**
  * Fetches all visible Wix Store Categories (Collections) for the central /catering hub.
  */
-export async function getCateringCategories() {
+export async function getCateringCategories(client?: any) {
+  const wixClient = client || (await getServerWixClient());
   const res = await wixClient.collections.queryCollections().find();
   return res.items.filter(
     (col: any) => col.slug !== "all-products" && col.visible !== false
@@ -73,14 +75,26 @@ export async function getCateringMenuBySlug(
   slug: string,
   dishCollectionId = "CanapeDishes",
   rulesCollectionId = "CateringTiers",
-  presentationsCollectionId = "CateringPresentations"
+  presentationsCollectionId = "CateringPresentations",
+  client?: any
 ) {
-  const colRes = await wixClient.collections
-    .queryCollections()
-    .eq("slug", slug)
-    .find();
+  const wixClient = client || (await getServerWixClient());
+  let colRes;
 
-  const category = colRes.items[0];
+  try {
+    colRes = await wixClient.collections.getCollectionBySlug(slug);
+  } catch (err: any) {
+    // If slug doesn't exist in Wix Stores, return null so Next.js renders notFound()
+    if (
+      err?.details?.applicationError?.code === "IDENTITY_NOT_FOUND" ||
+      err?.message?.includes("not found")
+    ) {
+      return null;
+    }
+    throw err;
+  }
+
+  const category = colRes?.collection;
   if (!category) {
     return null;
   }

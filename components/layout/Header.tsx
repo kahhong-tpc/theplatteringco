@@ -50,9 +50,9 @@ export default function Header({ menuOpen, searchOpen, contactOpen, onMenu, onSe
           <button type="button" aria-label="Saved" className={iconBtn}>
             <HeartIcon />
           </button>
-          <button type="button" aria-label="Account" className={iconBtn}>
+          <Link type="button" aria-label="Account" className={iconBtn} href="/account">
             <UserIcon />
-          </button>
+          </Link>
           <button type="button" aria-label={`Bag, ${count} items`} className={iconBtn}>
             <BagIcon />
             <span

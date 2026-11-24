@@ -3,6 +3,7 @@ import { createClient, OAuthStrategy } from "@wix/sdk";
 import { products, collections } from "@wix/stores";
 import { items } from "@wix/data";
 import { cookies } from "next/headers";
+import { members } from "@wix/members";
 
 export async function getServerWixClient() {
   const cookieStore = await cookies();
@@ -18,7 +19,7 @@ export async function getServerWixClient() {
   }
 
   const client = createClient({
-    modules: { products, collections, items },
+    modules: { products, collections, items, members },
     auth: OAuthStrategy({
       clientId: process.env.NEXT_PUBLIC_WIX_CLIENT_ID!,
       tokens: parsedTokens,

@@ -252,3 +252,18 @@ export async function completeGoogleLoginCallback() {
   sessionStorage.removeItem(OAUTH_STATE_KEY);
   persistTokens(tokens);
 }
+
+export async function loginWithWixHostedAuth(redirectAfter = "/account") {
+  const redirectUri = `${window.location.origin}/auth/callback`;
+
+  const loginRequestData = wixClient.auth.generateOAuthData(
+    redirectUri,
+    `${window.location.origin}${redirectAfter}`
+  );
+  sessionStorage.setItem(OAUTH_STATE_KEY, JSON.stringify(loginRequestData));
+
+  const { authUrl } = await wixClient.auth.getAuthUrl(loginRequestData, {
+    prompt: "login",
+  });
+  window.location.href = authUrl;
+}

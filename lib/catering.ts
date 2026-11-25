@@ -9,6 +9,7 @@ export interface TierRule {
   startTime: string;
   endTime: string;
   sortOrder: number;
+  paxInterval: number;
 }
 
 export interface PresentationPriceTier {
@@ -140,6 +141,7 @@ export async function getCateringMenuBySlug(
         startTime: data.startTime ? String(data.startTime).trim() : "08:00",
         endTime: data.endTime ? String(data.endTime).trim() : "19:00",
         sortOrder: data.sortOrder !== undefined ? Number(data.sortOrder) : 999,
+        paxInterval: Math.max(1, Number(item.paxInterval || item.data?.paxInterval || 5)),
       };
     }
   });

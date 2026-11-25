@@ -43,6 +43,14 @@ export async function POST(req: NextRequest) {
     const orderNumber = order?.number ? String(order.number) : undefined;
     const memberId = order?.buyerInfo?.memberId;
     const email = order?.buyerInfo?.email || "";
+    const contact =
+      order?.billingInfo?.contactDetails ||
+      order?.shippingInfo?.logistics?.shippingDestination?.contactDetails;
+    const name =
+      [contact?.firstName, contact?.lastName]
+        .filter(Boolean)
+        .join(" ")
+        .trim() || email;
 
     const totalPaid = Number(
       order?.priceSummary?.total?.amount ??
@@ -68,6 +76,7 @@ export async function POST(req: NextRequest) {
 
     const result = await awardPointsForOrder({
       memberId,
+      name,
       email,
       orderId,
       orderNumber,

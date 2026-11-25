@@ -12,6 +12,7 @@ export interface AddOnOptionItem {
   exclusions: string[];
   customPickers?: Record<string, number>;
   sortOrder: number;
+  paxInterval?: number;
 }
 
 export interface AddOnGroupItem {
@@ -56,6 +57,12 @@ export async function fetchCateringAddOns(wixClient: any): Promise<AddOnGroupIte
       typeof rawOpt.group === "string" ? rawOpt.group : rawOpt.group?._id;
     if (!groupId) continue;
 
+    const rawInterval = Number(rawOpt.paxInterval ?? rawOpt.data?.paxInterval);
+    const paxInterval =
+    Number.isFinite(rawInterval) && rawInterval > 0
+        ? Math.floor(rawInterval)
+        : undefined;
+
     const option: AddOnOptionItem = {
       _id: rawOpt._id,
       title: rawOpt.title || "",
@@ -67,6 +74,7 @@ export async function fetchCateringAddOns(wixClient: any): Promise<AddOnGroupIte
       pricingType: rawOpt.pricingType || "flat",
       inclusions: Array.isArray(rawOpt.inclusions) ? rawOpt.inclusions : [],
       exclusions: Array.isArray(rawOpt.exclusions) ? rawOpt.exclusions : [],
+      paxInterval,
       customPickers:
         rawOpt.customPickers && typeof rawOpt.customPickers === "object"
           ? rawOpt.customPickers

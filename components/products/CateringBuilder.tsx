@@ -27,6 +27,14 @@ export interface AddOnProduct {
   formattedPrice: string;
 }
 
+export interface BlackoutDateRule {
+  _id: string;
+  startDate: string; // "YYYY-MM-DD"
+  endDate?: string;  // "YYYY-MM-DD"
+  categoryIds?: string[];
+  reason?: string;
+}
+
 const DEFAULT_RULE: TierRule = {
   limitProduct: 3,
   beverages: 1,
@@ -35,10 +43,18 @@ const DEFAULT_RULE: TierRule = {
   startTime: "08:00",
   endTime: "19:00",
   sortOrder: 999,
+  paxInterval: 5,
 };
 
 const STORAGE_KEY = "catering_guest_draft";
 const WIX_STORES_APP_ID = "215238eb-22a5-4c36-9e7b-e7c08025e04e";
+
+function formatLocalDate(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
 
 export default function CateringBuilder({
   tiers,
@@ -49,6 +65,7 @@ export default function CateringBuilder({
   addOnGroups = [],
   categorySlug,
   drinkMenus = {},
+  blackoutDates = [],
 }: {
   tiers: any[];
   dishes: Dish[];
@@ -58,6 +75,7 @@ export default function CateringBuilder({
   addOnGroups?: AddOnGroupItem[];
   categorySlug?: string;
   drinkMenus?: Record<string, string[]>;
+  blackoutDates?: BlackoutDateRule[];
 }) {
   // Match Store Product name against CMS title (longest-first prevents partial collisions)
   const getRuleForTier = (tier: any): TierRule => {
@@ -97,6 +115,11 @@ export default function CateringBuilder({
   const [pax, setPax] = useState<number>(() => getRuleForTier(tiers[0]).minPax);
   const [eventDate, setEventDate] = useState<string>("");
   const [eventTime, setEventTime] = useState<string>("12:00");
+  const [isDatePickerOpen, setIsDatePickerOpen] = useState(false);
+  const [calendarMonth, setCalendarMonth] = useState(() => {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth(), 1);
+  });
 
   // Step 2 State: Table Styling & Nested Add-Ons
   const [selectedPresentationId, setSelectedPresentationId] = useState<string>(
@@ -156,7 +179,6 @@ export default function CateringBuilder({
     const stepParam = params.get("step");
 
     if (stepParam === "4") {
-      sessionStorage.removeItem(STORAGE_KEY);
       setStep(4);
       setConfirmedCheckoutId(params.get("checkoutId"));
       return;
@@ -209,22 +231,42 @@ export default function CateringBuilder({
       return;
     }
 
+    // Read draft contact details (or member profile) before/after redirect
+    let draftName = contactName;
+    let draftEmail = contactEmail;
+    try {
+      const raw = sessionStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        draftName ||= parsed.contactName || "";
+        draftEmail ||= parsed.contactEmail || "";
+      }
+    } catch {}
+
+    const finalName =
+      draftName ||
+      `${member?.firstName || ""} ${member?.lastName || ""}`.trim();
+    const finalEmail = draftEmail || member?.email || "";
+
     fetch("/api/loyalty/award", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         checkoutId,
         fallbackTotal: urlTotal,
+        name: finalName,
+        email: finalEmail,
       }),
     })
       .then((res) => res.json())
       .then((data) => {
+        sessionStorage.removeItem(STORAGE_KEY);
         if (data?.awarded) {
           setLoyaltyAward(data);
         }
       })
       .catch((err) => console.error("Loyalty award error:", err));
-  }, [isLoggedIn]);
+  }, [isLoggedIn, member]);
 
   // Singapore 6-Digit Postal Code Lookup
   useEffect(() => {
@@ -277,15 +319,34 @@ export default function CateringBuilder({
         const option = group?.options.find((o) => o._id === sel.optionId);
         if (!group || !option) return null;
 
-        const lineTotal =
-          option.pricingType === "per_pax"
-            ? option.price * pax
-            : option.price * sel.quantity;
+        const isFreeFlowBar =
+          group.selectionMode === "single" &&
+          (group.title.toLowerCase().includes("free flow") ||
+            Boolean(option.customPickers) ||
+            option.inclusions.length > 0);
 
-        const pickedDetails = Object.entries(sel.pickedItems || {})
+        const effectiveBarPax = Math.max(20, sel.barPax ?? pax);
+        const effectiveBarHours = Math.max(2, sel.barHours ?? 2);
+        const effectiveBarStart = sel.barStartTime || eventTime;
+
+        const lineTotal = isFreeFlowBar
+          ? option.price * effectiveBarPax * effectiveBarHours
+          : option.pricingType === "per_pax"
+          ? option.price * pax
+          : option.price * sel.quantity;
+
+        const barScheduleDetail = isFreeFlowBar
+          ? `${effectiveBarPax} pax, ${effectiveBarHours} hrs, starts ${effectiveBarStart}`
+          : "";
+
+        const drinkDetails = Object.entries(sel.pickedItems || {})
           .filter(([, list]) => list.length > 0)
           .map(([key, list]) => `${key}: ${list.join(", ")}`)
           .join(" | ");
+
+        const pickedDetails = [barScheduleDetail, drinkDetails]
+          .filter(Boolean)
+          .join(" • ");
 
         return {
           ...sel,
@@ -295,10 +356,11 @@ export default function CateringBuilder({
           unitPrice: option.price,
           lineTotal,
           pickedDetails,
+          isFreeFlowBar,
         };
       })
       .filter((item): item is NonNullable<typeof item> => item !== null);
-  }, [selectedAddOns, addOnGroups, pax]);
+  }, [selectedAddOns, addOnGroups, pax, eventTime]);
 
   if (!tiers || tiers.length === 0) {
     return (
@@ -310,6 +372,64 @@ export default function CateringBuilder({
   }
 
   const rules = getRuleForTier(selectedTier);
+  const paxStep = Math.max(1, Number(rules?.paxInterval || 5));
+
+  const normalizePax = (rawValue: number) => {
+    const min = rules.minPax || 20;
+    const max = rules.maxPax || 500;
+    const clamped = Math.min(max, Math.max(min, rawValue));
+    const offset = clamped - min;
+    const snapped = min + Math.round(offset / paxStep) * paxStep;
+    return Math.min(max, Math.max(min, snapped));
+  };
+
+  // Local YYYY-MM-DD (avoids UTC off-by-one shifts in Singapore UTC+8)
+  const minSelectableDate = useMemo(() => {
+    return formatLocalDate(new Date());
+  }, []);
+
+  const getBlackoutForDate = (date: string) => {
+    const tierCats: string[] = selectedTier?.collectionIds || [];
+
+    return (
+      blackoutDates.find((rule) => {
+        const start = rule.startDate;
+        const end = rule.endDate || rule.startDate;
+        if (!start || date < start || date > end) return false;
+        if (!Array.isArray(rule.categoryIds)) return false;
+        if (rule.categoryIds.length === 0) return true;
+
+        return rule.categoryIds.some(
+          (id) =>
+            tierCats.includes(id) ||
+            (categorySlug && id.toLowerCase() === categorySlug.toLowerCase())
+        );
+      }) || null
+    );
+  };
+
+  // Check if eventDate falls inside any blackout window for the selected tier's category
+  const activeBlackout = useMemo(() => {
+    return eventDate ? getBlackoutForDate(eventDate) : null;
+  }, [eventDate, selectedTier, blackoutDates, categorySlug]);
+
+  const calendarDays = useMemo(() => {
+    const year = calendarMonth.getFullYear();
+    const month = calendarMonth.getMonth();
+    const leadingDays = new Date(year, month, 1).getDay();
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+
+    return [
+      ...Array.from<number>({ length: leadingDays }).fill(0),
+      ...Array.from({ length: daysInMonth }, (_, index) => index + 1),
+    ];
+  }, [calendarMonth]);
+
+  useEffect(() => {
+    if (!eventDate) return;
+    const [year, month] = eventDate.split("-").map(Number);
+    if (year && month) setCalendarMonth(new Date(year, month - 1, 1));
+  }, [eventDate]);
 
   // Normalize flat vs nested Wix CMS dish items
   const normalizedDishes = dishes.map((d) => ({
@@ -387,15 +507,20 @@ export default function CateringBuilder({
   };
 
   // Step 1 Validation
-  const isValidPax = pax >= rules.minPax && pax <= rules.maxPax;
-  const isValidTime =
-    eventTime >= rules.startTime && eventTime <= rules.endTime;
+  const isPastDate = Boolean(eventDate && eventDate < minSelectableDate);
+  const isDateAvailable = eventDate.trim().length > 0 && !isPastDate && !activeBlackout;
+  const isValidPax =
+    pax >= rules.minPax &&
+    pax <= rules.maxPax &&
+    (pax - rules.minPax) % paxStep === 0;
+  const isValidTime = eventTime >= rules.startTime && eventTime <= rules.endTime;
   const isStep1Complete =
     selectedCanapes.length === rules.limitProduct &&
     selectedBeverages.length === rules.beverages &&
     isValidPax &&
     isValidTime &&
-    eventDate.trim().length > 0;
+    isDateAvailable;
+    // eventDate.trim().length > 0;
 
   // Step 2 Selection & Validation
   const activePresentation =
@@ -471,49 +596,53 @@ export default function CateringBuilder({
         },
       ];
 
-      // 3. Add Presentation Styling line item (backed by a $1 Store product)
-      if (
-        activePresentation &&
-        presentationPrice > 0 &&
-        activePresentation.productId
-      ) {
+      // 3. Add Table Presentation Styling as its own separate line item
+      const presentationProductId =
+        activePresentation?.productId ||
+        presentations.find((p) => p.productId)?.productId ||
+        process.env.NEXT_PUBLIC_WIX_TABLE_STYLING_PRODUCT_ID;
+
+      if (presentationPrice > 0) {
+        if (!presentationProductId) {
+          throw new Error(
+            "Missing Store productId for Table Presentation in CateringPresentations CMS."
+          );
+        }
+
         lineItems.push({
           catalogReference: {
             appId: WIX_STORES_APP_ID,
-            catalogItemId: activePresentation.productId,
-            options: {
-              customTextFields: {
-                "Selected Styling": `${activePresentation.title} (${pax} pax)`,
-              },
-            },
+            catalogItemId: presentationProductId,
           },
           quantity: Math.round(presentationPrice),
         });
       }
 
-      // 4. Add CMS Add-Ons (cocktails, equipment, etc.) via a $1 Store product
+      // 4. Add CMS Add-Ons as a separate line item (using the Catering Add-Ons $1 product)
       const customAddOnProductId =
-        process.env.NEXT_PUBLIC_WIX_CUSTOM_ADDON_PRODUCT_ID ||
-        activePresentation?.productId ||
-        presentations.find((p) => p.productId)?.productId;
+        process.env.NEXT_PUBLIC_WIX_CUSTOM_ADDON_PRODUCT_ID;
 
-      if (resolvedSelectedAddOns.some((a) => a.lineTotal > 0) && !customAddOnProductId) {
-        throw new Error(
-          "Missing NEXT_PUBLIC_WIX_CUSTOM_ADDON_PRODUCT_ID for add-on checkout."
-        );
-      }
+      const addOnsDollarQty = resolvedSelectedAddOns.reduce(
+        (sum, addOn) =>
+          addOn.lineTotal > 0 ? sum + Math.round(addOn.lineTotal) : sum,
+        0
+      );
 
-      resolvedSelectedAddOns.forEach((addOn) => {
-        if (addOn.lineTotal > 0 && customAddOnProductId) {
-          lineItems.push({
-            catalogReference: {
-              appId: WIX_STORES_APP_ID,
-              catalogItemId: customAddOnProductId,
-            },
-            quantity: Math.round(addOn.lineTotal),
-          });
+      if (addOnsDollarQty > 0) {
+        if (!customAddOnProductId) {
+          throw new Error(
+            "Missing NEXT_PUBLIC_WIX_CUSTOM_ADDON_PRODUCT_ID for add-on checkout."
+          );
         }
-      });
+
+        lineItems.push({
+          catalogReference: {
+            appId: WIX_STORES_APP_ID,
+            catalogItemId: customAddOnProductId,
+          },
+          quantity: addOnsDollarQty,
+        });
+      }
 
       // 5. Add legacy Store Product Add-Ons if any
       legacyActiveAddOns.forEach((addOn) => {
@@ -631,7 +760,7 @@ export default function CateringBuilder({
   ];
 
   return (
-    <div className="mx-auto max-w-6xl space-y-8 p-6">
+    <div className="mx-auto max-w-7xl space-y-8 p-6">
       {/* 4-Step Progress Bar (Backward-Only Clickable) */}
       <nav aria-label="Progress" className="border-b border-gray-200 pb-4">
         <ol className="grid grid-cols-2 gap-2 text-sm font-medium sm:grid-cols-4">
@@ -892,6 +1021,8 @@ export default function CateringBuilder({
                       }
                       currentCategorySlug={categorySlug}
                       pax={pax}
+                      paxInterval={paxStep}
+                      eventTime={eventTime}
                       selectedAddOns={selectedAddOns}
                       onChangeSelectedAddOns={setSelectedAddOns}
                       drinkMenus={drinkMenus}
@@ -1269,55 +1400,241 @@ export default function CateringBuilder({
               </div>
 
               {step === 1 && (
-                <div className="mt-4 flex flex-row flex-wrap gap-4">
+                <div className="mt-4 flex flex-col gap-4">
                   <div className="w-full">
                     <label className="block text-sm font-medium text-gray-700">
                       Guests ({rules.minPax}–{rules.maxPax})
                     </label>
+
                     <input
                       type="number"
                       min={rules.minPax}
                       max={rules.maxPax}
+                      step={paxStep}
                       value={pax}
-                      onChange={(e) => setPax(Number(e.target.value))}
+                      onChange={(e) => {
+                        const val = Number(e.target.value);
+                        setPax(Number.isNaN(val) ? rules.minPax : val);
+                      }}
+                      onBlur={(e) =>
+                        setPax(normalizePax(Number(e.target.value) || rules.minPax))
+                      }
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          setPax(normalizePax(pax));
+                        }
+                      }}
                       className="mt-1 w-full rounded-lg border border-gray-300 bg-white px-3 py-2 font-semibold"
                     />
                     {!isValidPax && (
                       <p className="mt-1 text-xs text-red-600">
-                        {rules.minPax}–{rules.maxPax} pax required.
+                        Minimum of {rules.minPax} pax required.
                       </p>
                     )}
                   </div>
 
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700">
-                      Event Date *
-                    </label>
-                    <input
-                      type="date"
-                      value={eventDate}
-                      onChange={(e) => setEventDate(e.target.value)}
-                      className="mt-1 rounded-lg border border-gray-300 bg-white px-3 py-2 font-semibold"
-                    />
-                  </div>
+                  <div className="flex gap-4">
+                    <div className="w-1/2">
+                      <label className="block text-sm font-medium text-gray-700">
+                        Event Date *
+                      </label>
+                      <div className="relative mt-1">
+                        <input
+                          type="text"
+                          readOnly
+                          placeholder="Select date"
+                          value={
+                            eventDate
+                              ? new Date(`${eventDate}T00:00:00`).toLocaleDateString()
+                              : ""
+                          }
+                          onFocus={() => setIsDatePickerOpen(true)}
+                          onClick={() => setIsDatePickerOpen(true)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Escape") setIsDatePickerOpen(false);
+                          }}
+                          aria-haspopup="dialog"
+                          aria-expanded={isDatePickerOpen}
+                          aria-controls="event-date-picker"
+                          className={`w-full rounded-lg border bg-white px-3 py-2 font-semibold ${
+                            isPastDate || activeBlackout
+                              ? "border-red-500 text-red-700"
+                              : "border-gray-300"
+                          } pr-10`}
+                        />
+                        <button
+                          type="button"
+                          aria-label="Open calendar"
+                          aria-haspopup="dialog"
+                          aria-expanded={isDatePickerOpen}
+                          aria-controls="event-date-picker"
+                          onClick={() => setIsDatePickerOpen(true)}
+                          className="absolute inset-y-0 right-0 flex items-center px-3 text-gray-500 hover:text-gray-800"
+                        >
+                          <svg
+                            aria-hidden="true"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="1.8"
+                            className="h-5 w-5"
+                          >
+                            <rect
+                              x="3.5"
+                              y="5"
+                              width="17"
+                              height="16"
+                              rx="2"
+                            />
+                            <path d="M7.5 3.5v3M16.5 3.5v3M3.5 9.5h17" />
+                          </svg>
+                        </button>
+                        {isDatePickerOpen && (
+                          <div
+                            id="event-date-picker"
+                            role="dialog"
+                            aria-label="Choose event date"
+                            className="absolute left-0 top-full z-20 mt-1 w-72 rounded-lg border border-gray-300 bg-white p-3 shadow-lg"
+                          >
+                            <div className="mb-3 flex items-center justify-between">
+                              <button
+                                type="button"
+                                aria-label="Previous month"
+                                disabled={
+                                  calendarMonth.getFullYear() ===
+                                    Number(minSelectableDate.slice(0, 4)) &&
+                                  calendarMonth.getMonth() ===
+                                    Number(minSelectableDate.slice(5, 7)) - 1
+                                }
+                                onClick={() =>
+                                  setCalendarMonth(
+                                    (month) =>
+                                      new Date(
+                                        month.getFullYear(),
+                                        month.getMonth() - 1,
+                                        1
+                                      )
+                                  )
+                                }
+                                className="rounded px-2 py-1 text-gray-700 hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-30"
+                              >
+                                ‹
+                              </button>
+                              <span className="text-sm font-semibold text-gray-900">
+                                {calendarMonth.toLocaleDateString(undefined, {
+                                  month: "long",
+                                  year: "numeric",
+                                })}
+                              </span>
+                              <button
+                                type="button"
+                                aria-label="Next month"
+                                onClick={() =>
+                                  setCalendarMonth(
+                                    (month) =>
+                                      new Date(
+                                        month.getFullYear(),
+                                        month.getMonth() + 1,
+                                        1
+                                      )
+                                  )
+                                }
+                                className="rounded px-2 py-1 text-gray-700 hover:bg-gray-100"
+                              >
+                                ›
+                              </button>
+                            </div>
+                            <div className="grid grid-cols-7 text-center text-xs text-gray-500">
+                              {["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"].map(
+                                (weekday) => (
+                                  <span
+                                    key={weekday}
+                                    className="py-1 font-medium"
+                                  >
+                                    {weekday}
+                                  </span>
+                                )
+                              )}
+                              {calendarDays.map((day, index) => {
+                                if (day === 0) {
+                                  return <span key={`empty-${index}`} />;
+                                }
 
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700">
-                      Start Time ({rules.startTime}–{rules.endTime})
-                    </label>
-                    <input
-                      type="time"
-                      min={rules.startTime}
-                      max={rules.endTime}
-                      value={eventTime}
-                      onChange={(e) => setEventTime(e.target.value)}
-                      className="mt-1 w-32 rounded-lg border border-gray-300 bg-white px-3 py-2 font-semibold"
-                    />
-                    {!isValidTime && (
-                      <p className="mt-1 text-xs text-red-600">
-                        {rules.startTime}–{rules.endTime} only.
-                      </p>
-                    )}
+                                const date = formatLocalDate(
+                                  new Date(
+                                    calendarMonth.getFullYear(),
+                                    calendarMonth.getMonth(),
+                                    day
+                                  )
+                                );
+                                const blackout = getBlackoutForDate(date);
+                                const disabled =
+                                  date < minSelectableDate || Boolean(blackout);
+
+                                return (
+                                  <button
+                                    key={date}
+                                    type="button"
+                                    disabled={disabled}
+                                    aria-label={`${date}${blackout ? ", unavailable" : ""}`}
+                                    aria-pressed={eventDate === date}
+                                    title={
+                                      blackout?.reason ||
+                                      (date < minSelectableDate
+                                        ? "Past dates are unavailable"
+                                        : undefined)
+                                    }
+                                    onClick={() => {
+                                      setEventDate(date);
+                                      setIsDatePickerOpen(false);
+                                    }}
+                                    className={`mx-auto flex h-9 w-9 items-center justify-center rounded-full text-sm ${
+                                      eventDate === date
+                                        ? "bg-black font-semibold text-white"
+                                        : disabled
+                                        ? "cursor-not-allowed text-gray-300 line-through"
+                                        : "text-gray-800 hover:bg-gray-100"
+                                    }`}
+                                  >
+                                    {day}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                      {isPastDate && (
+                        <p className="mt-1 text-xs text-red-600">
+                          Please select today or a future date.
+                        </p>
+                      )}
+                      {!isPastDate && activeBlackout && (
+                        <p className="mt-1 text-xs text-red-600">
+                          {activeBlackout.reason || "Closed for this category on the selected date."}
+                        </p>
+                      )}
+                    </div>
+
+                    <div className="w-1/2">
+                      <label className="block text-sm font-medium text-gray-700">
+                        Start Time {/*<br />  ({rules.startTime}–{rules.endTime})*/}
+                      </label>
+                      <input
+                        type="time"
+                        min={rules.startTime}
+                        max={rules.endTime}
+                        value={eventTime}
+                        onChange={(e) => setEventTime(e.target.value)}
+                        className="mt-1 w-32 rounded-lg border border-gray-300 bg-white px-3 py-2 font-semibold w-full"
+                      />
+                      {!isValidTime && (
+                        <p className="mt-1 text-xs text-red-600">
+                          {rules.startTime}–{rules.endTime} only.
+                        </p>
+                      )}
+                    </div>
                   </div>
                 </div>
               )}
@@ -1479,9 +1796,9 @@ export default function CateringBuilder({
                       ? "Next: Presentation & Add-Ons →"
                       : !eventDate
                       ? "Select Event Date"
-                      : `Pick ${
-                          rules.limitProduct - selectedCanapes.length
-                        } canapé(s) & ${
+                      : isPastDate || activeBlackout
+                      ? "Selected Date Unavailable"
+                      : `Pick ${rules.limitProduct - selectedCanapes.length} canapé(s) & ${
                           rules.beverages - selectedBeverages.length
                         } drink(s)`}
                   </button>

@@ -1,7 +1,26 @@
 import { wixClient } from "@/lib/wixClient";
 import { getServerWixClient } from "@/lib/wixClientServer";
 
+export interface MenuDishItem {
+  _id: string;
+  title: string;
+  description?: string;
+  dietaryTags?: string[];
+  sortOrder: number;
+}
+
+export interface MenuSection {
+  _id: string;
+  title: string;
+  description?: string;
+  selectionType: "fixed" | "choice";
+  selectLimit: number;
+  sortOrder: number;
+  items: MenuDishItem[];
+}
+
 export interface TierRule {
+  _id?: string;
   limitProduct: number;
   beverages: number;
   minPax: number;
@@ -10,6 +29,9 @@ export interface TierRule {
   endTime: string;
   sortOrder: number;
   paxInterval: number;
+  title: string;
+  description?: string;
+  sections: MenuSection[];
 }
 
 export interface PresentationPriceTier {
@@ -24,6 +46,50 @@ export interface PresentationOption {
   imageUrl?: string;
   priceTiers: PresentationPriceTier[];
   productId?: string;
+}
+
+/**
+ * Preserves `0` in CMS instead of overwriting it via `|| default`.
+ */
+function parseNumericField(raw: unknown, fallback: number): number {
+  if (raw === undefined || raw === null || raw === "") return fallback;
+  const parsed = Number(raw);
+  return Number.isNaN(parsed) ? fallback : parsed;
+}
+
+/**
+ * Normalizes Wix reference / multi-reference fields (string IDs or `{ _id }` objects).
+ */
+function extractReferenceIds(rawRef: unknown): string[] {
+  if (!rawRef) return [];
+  const items = Array.isArray(rawRef) ? rawRef : [rawRef];
+  return items
+    .map((entry) => {
+      if (typeof entry === "string") return entry.trim();
+      if (entry && typeof entry === "object" && "_id" in entry) {
+        return String((entry as { _id: unknown })._id).trim();
+      }
+      return "";
+    })
+    .filter(Boolean);
+}
+
+/**
+ * Normalizes dietaryTags whether stored as Wix Tags (`string[]`) or comma-separated Text.
+ */
+function parseDietaryTags(raw: unknown): string[] | undefined {
+  if (Array.isArray(raw)) {
+    const tags = raw.map((t) => String(t).trim()).filter(Boolean);
+    return tags.length > 0 ? tags : undefined;
+  }
+  if (typeof raw === "string" && raw.trim()) {
+    const tags = raw
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
+    return tags.length > 0 ? tags : undefined;
+  }
+  return undefined;
 }
 
 /**
@@ -59,33 +125,94 @@ function parsePriceTiers(raw?: string): PresentationPriceTier[] {
 }
 
 /**
+ * Builds legacy Canapés & Beverages sections when a tier has no `MenuSections` linked yet.
+ */
+function buildLegacyCanapeSections(
+  tierId: string,
+  limitProduct: number,
+  beveragesLimit: number,
+  legacyDishes: any[]
+): MenuSection[] {
+  const sections: MenuSection[] = [];
+
+  const normalizedDishes = legacyDishes.map((raw: any, idx: number) => {
+    const d = raw.data || raw;
+    return {
+      _id: String(raw._id || `legacy-dish-${idx}`),
+      title: String(d.title || "").trim(),
+      description: d.description ? String(d.description).trim() : undefined,
+      dietaryTags: parseDietaryTags(d.dietaryTags),
+      sortOrder: parseNumericField(d.sortOrder, idx + 1),
+      type: String(d.type || d.category || "").toLowerCase(),
+    };
+  });
+
+  const isBeverageDish = (d: { type: string }) =>
+    d.type.includes("beverage") || d.type.includes("drink");
+
+  if (limitProduct > 0) {
+    const canapeItems = normalizedDishes
+      .filter((d) => d.title && !isBeverageDish(d))
+      .map(({ type: _type, ...rest }) => rest);
+
+    sections.push({
+      _id: `legacy-canapes-${tierId}`,
+      title: "Canapés",
+      selectionType: "choice",
+      selectLimit: limitProduct,
+      sortOrder: 1,
+      items: canapeItems,
+    });
+  }
+
+  if (beveragesLimit > 0) {
+    const beverageItems = normalizedDishes
+      .filter((d) => d.title && isBeverageDish(d))
+      .map(({ type: _type, ...rest }) => rest);
+
+    sections.push({
+      _id: `legacy-beverages-${tierId}`,
+      title: "Beverages",
+      selectionType: "choice",
+      selectLimit: beveragesLimit,
+      sortOrder: 2,
+      items: beverageItems,
+    });
+  }
+
+  return sections;
+}
+
+/**
  * Fetches all visible Wix Store Categories (Collections) for the central /catering hub.
  */
 export async function getCateringCategories(client?: any) {
-  const wixClient = client || (await getServerWixClient());
-  const res = await wixClient.collections.queryCollections().find();
+  const activeClient = client || (await getServerWixClient());
+  const res = await activeClient.collections.queryCollections().find();
   return res.items.filter(
     (col: any) => col.slug !== "all-products" && col.visible !== false
   );
 }
 
 /**
- * Fetches a category by slug, plus its products, dishes, tier rules, and table presentations.
+ * Fetches a category by slug, plus its products, tier rules (indexed by Product ID
+ * and Title), dynamic sections/items, and table presentations.
  */
 export async function getCateringMenuBySlug(
   slug: string,
   dishCollectionId = "CanapeDishes",
   rulesCollectionId = "CateringTiers",
   presentationsCollectionId = "CateringPresentations",
-  client?: any
+  client?: any,
+  sectionsCollectionId = "MenuSections",
+  menuItemsCollectionId = "MenuItems"
 ) {
-  const wixClient = client || (await getServerWixClient());
+  const activeClient = client || (await getServerWixClient());
   let colRes;
 
   try {
-    colRes = await wixClient.collections.getCollectionBySlug(slug);
+    colRes = await activeClient.collections.getCollectionBySlug(slug);
   } catch (err: any) {
-    // If slug doesn't exist in Wix Stores, return null so Next.js renders notFound()
     if (
       err?.details?.applicationError?.code === "IDENTITY_NOT_FOUND" ||
       err?.message?.includes("not found")
@@ -100,53 +227,189 @@ export async function getCateringMenuBySlug(
     return null;
   }
 
-  // Fetch products, dishes, tier rules, and presentations in parallel
-  // .catch() on presentations ensures the page still loads even if the collection isn't created yet
-  const [productsRes, dishesRes, rulesRes, presentationsRes] = await Promise.all([
-    wixClient.products
+  // Fetch Store products + CMS collections in parallel.
+  // `.include("products")` populates the Stores/Products reference on CateringTiers.
+  const [
+    productsRes,
+    legacyDishesRes,
+    rulesRes,
+    presentationsRes,
+    sectionsRes,
+    menuItemsRes,
+  ] = await Promise.all([
+    activeClient.products
       .queryProducts()
       .hasSome("collectionIds", [category._id])
       .ascending("price")
       .find(),
-    wixClient.items.query(dishCollectionId).limit(100).find(),
-    wixClient.items.query(rulesCollectionId).limit(100).find(),
-    wixClient.items
+    activeClient.items
+      .query(dishCollectionId)
+      .limit(200)
+      .find()
+      .catch(() => ({ items: [] })),
+    activeClient.items
+      .query(rulesCollectionId)
+      .include("products")
+      .limit(100)
+      .find(),
+    activeClient.items
       .query(presentationsCollectionId)
       .limit(50)
+      .find()
+      .catch(() => ({ items: [] })),
+    activeClient.items
+      .query(sectionsCollectionId)
+      .include("tiers")
+      .limit(200)
+      .find()
+      .catch(() => ({ items: [] })),
+    activeClient.items
+      .query(menuItemsCollectionId)
+      .include("sections")
+      .limit(500)
       .find()
       .catch(() => ({ items: [] })),
   ]);
 
   const catName = String(category.name || "").toLowerCase();
   const catSlug = String(category.slug || "").toLowerCase();
+  const categoryProductIds = new Set(
+    (productsRes.items || []).map((p: any) => String(p._id))
+  );
 
-  // 1. Parse Tier Rules
+  // 1. Group MenuItems by referenced MenuSection ID
+  const itemsBySectionId: Record<string, MenuDishItem[]> = {};
+  (menuItemsRes.items || []).forEach((rawItem: any) => {
+    const data = rawItem.data || rawItem;
+    if (!data.title) return;
+
+    const dish: MenuDishItem = {
+      _id: String(rawItem._id),
+      title: String(data.title).trim(),
+      description: data.description ? String(data.description).trim() : undefined,
+      dietaryTags: parseDietaryTags(data.dietaryTags),
+      sortOrder: parseNumericField(data.sortOrder, 999),
+    };
+
+    const sectionIds = extractReferenceIds(data.sections ?? rawItem.sections);
+    sectionIds.forEach((secId) => {
+      if (!itemsBySectionId[secId]) itemsBySectionId[secId] = [];
+      itemsBySectionId[secId].push(dish);
+    });
+  });
+
+  Object.values(itemsBySectionId).forEach((list) =>
+    list.sort((a, b) => a.sortOrder - b.sortOrder || a.title.localeCompare(b.title))
+  );
+
+  // 2. Group MenuSections by referenced CateringTier ID
+  const sectionsByTierId: Record<string, MenuSection[]> = {};
+  (sectionsRes.items || []).forEach((rawSection: any) => {
+    const data = rawSection.data || rawSection;
+    if (!data.title) return;
+
+    const sectionId = String(rawSection._id);
+    const rawSelectionType = String(data.selectionType || "choice")
+      .trim()
+      .toLowerCase();
+    const selectionType: "fixed" | "choice" =
+      rawSelectionType === "fixed" ? "fixed" : "choice";
+    const selectLimit =
+      selectionType === "fixed" ? 0 : parseNumericField(data.selectLimit ?? data.select_limit ?? data.limit, 0);
+
+    const sectionObj: MenuSection = {
+      _id: sectionId,
+      title: String(data.title).trim(),
+      description: data.description ? String(data.description).trim() : undefined,
+      selectionType,
+      selectLimit,
+      sortOrder: parseNumericField(data.sortOrder, 999),
+      items: itemsBySectionId[sectionId] || [],
+    };
+
+    const tierIds = extractReferenceIds(data.tiers ?? rawSection.tiers);
+    tierIds.forEach((tierId) => {
+      if (!sectionsByTierId[tierId]) sectionsByTierId[tierId] = [];
+      sectionsByTierId[tierId].push(sectionObj);
+    });
+  });
+
+  Object.values(sectionsByTierId).forEach((list) =>
+    list.sort((a, b) => a.sortOrder - b.sortOrder)
+  );
+
+  // 3. Parse Tier Rules & Index by Product ID (primary) and Title (fallback)
+  const rulesByProductId: Record<string, TierRule> = {};
   const tierRules: Record<string, TierRule> = {};
-  rulesRes.items.forEach((item: any) => {
-    const data = item.data || item;
 
-    if (data.menuType) {
+  (rulesRes.items || []).forEach((item: any) => {
+    const data = item.data || item;
+    if (!data.title) return;
+
+    const linkedProductIds = extractReferenceIds(
+      data.products ?? item.products
+    );
+
+    if (linkedProductIds.length > 0) {
+      // Direct reference mode: keep tier only if at least one linked product is in this category
+      const belongsToCategory = linkedProductIds.some((pid) =>
+        categoryProductIds.has(pid)
+      );
+      if (!belongsToCategory) return;
+    } else if (data.menuType) {
+      // Legacy fallback mode when `products` reference is not yet linked
       const ruleType = String(data.menuType).trim().toLowerCase();
       if (!catName.includes(ruleType) && !catSlug.includes(ruleType)) {
         return;
       }
     }
 
-    if (data.title) {
-      tierRules[String(data.title).trim()] = {
-        limitProduct: Number(data.limitProduct) || 3,
-        beverages: Number(data.beverages) || 1,
-        minPax: Number(data.minPax) || 20,
-        maxPax: Number(data.maxPax) || 300,
-        startTime: data.startTime ? String(data.startTime).trim() : "08:00",
-        endTime: data.endTime ? String(data.endTime).trim() : "19:00",
-        sortOrder: data.sortOrder !== undefined ? Number(data.sortOrder) : 999,
-        paxInterval: Math.max(1, Number(item.paxInterval || item.data?.paxInterval || 5)),
-      };
-    }
+    const tierId = String(item._id);
+    const title = String(data.title).trim();
+    const limitProduct = parseNumericField(
+      data.limitProduct ?? data.limit_product ?? data.limit,
+      0
+    );
+    const beverages = parseNumericField(data.beverages, 0);
+
+    const dynamicSections = sectionsByTierId[tierId];
+    const hasDynamicSections =
+      Array.isArray(dynamicSections) && dynamicSections.length > 0;
+
+    const resolvedSections = hasDynamicSections
+      ? dynamicSections
+      : buildLegacyCanapeSections(
+          tierId,
+          limitProduct,
+          beverages,
+          legacyDishesRes.items || []
+        );
+
+    const ruleObj: TierRule = {
+      _id: tierId,
+      limitProduct,
+      beverages,
+      minPax: parseNumericField(data.minPax, 20),
+      maxPax: parseNumericField(data.maxPax, 300),
+      startTime: data.startTime ? String(data.startTime).trim() : "08:00",
+      endTime: data.endTime ? String(data.endTime).trim() : "19:00",
+      sortOrder: parseNumericField(data.sortOrder, 999),
+      title,
+      description: data.description ? String(data.description).trim() : undefined,
+      paxInterval: Math.max(
+        1,
+        parseNumericField(item.paxInterval ?? data.paxInterval, 5)
+      ),
+      sections: resolvedSections,
+    };
+
+    tierRules[title] = ruleObj;
+    linkedProductIds.forEach((pid) => {
+      rulesByProductId[pid] = ruleObj;
+    });
   });
 
-  // 2. Parse & Sort Presentations
+  // 4. Parse & Sort Presentations
   const presentations: PresentationOption[] = (presentationsRes.items || [])
     .map((item: any) => {
       const rawData = item.data || item;
@@ -157,7 +420,7 @@ export async function getCateringMenuBySlug(
     })
     .filter((data: any) => {
       if (!data.title) return false;
-      if (!data.menuType) return true; // Blank menuType applies to all menus
+      if (!data.menuType) return true;
       const presType = String(data.menuType).trim().toLowerCase();
       return catName.includes(presType) || catSlug.includes(presType);
     })
@@ -171,26 +434,27 @@ export async function getCateringMenuBySlug(
       productId: data.productId ? String(data.productId).trim() : undefined,
     }));
 
-  // 3. Sort Store Products by CMS sortOrder
+  // 5. Sort Store Products by CMS sortOrder (ID match first, title match fallback)
   const sortedRuleKeys = Object.keys(tierRules).sort((a, b) => b.length - a.length);
-  const sortedTiers = [...productsRes.items].sort((a: any, b: any) => {
-    const nameA = (a.name || "").toLowerCase();
-    const nameB = (b.name || "").toLowerCase();
+  const getSortOrderForProduct = (product: any): number => {
+    if (product?._id && rulesByProductId[product._id]) {
+      return rulesByProductId[product._id].sortOrder;
+    }
+    const name = (product?.name || "").toLowerCase();
+    const matchedKey = sortedRuleKeys.find((k) => name.includes(k.toLowerCase()));
+    return matchedKey ? tierRules[matchedKey].sortOrder : 999;
+  };
 
-    const keyA = sortedRuleKeys.find((k) => nameA.includes(k.toLowerCase()));
-    const keyB = sortedRuleKeys.find((k) => nameB.includes(k.toLowerCase()));
-
-    const orderA = keyA ? tierRules[keyA].sortOrder : 999;
-    const orderB = keyB ? tierRules[keyB].sortOrder : 999;
-
-    return orderA - orderB;
-  });
+  const sortedTiers = [...productsRes.items].sort(
+    (a: any, b: any) => getSortOrderForProduct(a) - getSortOrderForProduct(b)
+  );
 
   return {
     category,
     tiers: sortedTiers,
-    dishes: dishesRes.items,
+    dishes: legacyDishesRes.items,
     tierRules,
+    rulesByProductId,
     presentations,
   };
 }

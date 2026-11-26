@@ -114,6 +114,7 @@ export default async function DynamicCateringMenuPage({
         drinkMenus={drinkMenus}
         categorySlug={slug}
         blackoutDates={blackoutDates}
+        rulesByProductId={data.rulesByProductId || {}}
       />
     </main>
   );

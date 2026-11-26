@@ -6,6 +6,7 @@ import { TierRule, PresentationOption } from "@/lib/catering";
 import Step2AddOns, { SelectedAddOn } from "@/components/addon/addon";
 import type { AddOnGroupItem } from "@/lib/wix-addon";
 import { useAuth } from "@/context/AuthContext";
+import { MenuSection } from "@/lib/catering";
 
 export interface Dish {
   _id: string;
@@ -36,14 +37,16 @@ export interface BlackoutDateRule {
 }
 
 const DEFAULT_RULE: TierRule = {
-  limitProduct: 3,
-  beverages: 1,
+  limitProduct: 0,
+  beverages: 0,
   minPax: 20,
   maxPax: 300,
   startTime: "08:00",
   endTime: "19:00",
   sortOrder: 999,
   paxInterval: 5,
+  title: "Product",
+  sections: [],
 };
 
 const STORAGE_KEY = "catering_guest_draft";
@@ -66,6 +69,7 @@ export default function CateringBuilder({
   categorySlug,
   drinkMenus = {},
   blackoutDates = [],
+  rulesByProductId = {},
 }: {
   tiers: any[];
   dishes: Dish[];
@@ -76,10 +80,19 @@ export default function CateringBuilder({
   categorySlug?: string;
   drinkMenus?: Record<string, string[]>;
   blackoutDates?: BlackoutDateRule[];
+  rulesByProductId?: Record<string, TierRule>;
 }) {
   // Match Store Product name against CMS title (longest-first prevents partial collisions)
   const getRuleForTier = (tier: any): TierRule => {
-    const productName = (tier?.name || "").toLowerCase();
+    if (!tier) return DEFAULT_RULE;
+
+    // 1. Primary: exact Wix Store Product ID via `products` Multi-Reference
+    if (tier._id && rulesByProductId[tier._id]) {
+      return rulesByProductId[tier._id];
+    }
+
+    // 2. Fallback: existing productName / title match for unlinked rows
+    const productName = (tier.name || "").toLowerCase();
     const matchedKey = Object.keys(tierRules)
       .sort((a, b) => b.length - a.length)
       .find((title) => productName.includes(title.toLowerCase()));
@@ -110,8 +123,6 @@ export default function CateringBuilder({
 
   // Step 1 State: Package, Items, Pax & Event Date/Time
   const [selectedTier, setSelectedTier] = useState(tiers[0]);
-  const [selectedCanapes, setSelectedCanapes] = useState<string[]>([]);
-  const [selectedBeverages, setSelectedBeverages] = useState<string[]>([]);
   const [pax, setPax] = useState<number>(() => getRuleForTier(tiers[0]).minPax);
   const [eventDate, setEventDate] = useState<string>("");
   const [eventTime, setEventTime] = useState<string>("12:00");
@@ -120,11 +131,49 @@ export default function CateringBuilder({
     const now = new Date();
     return new Date(now.getFullYear(), now.getMonth(), 1);
   });
+  const [selectedBySection, setSelectedBySection] = useState<
+    Record<string, string[]>
+  >({});
+
+  const toggleSectionItem = (
+    sectionId: string,
+    dishTitle: string,
+    sectionLimit: number
+  ) => {
+    setSelectedBySection((prev) => {
+      const current = prev[sectionId] || [];
+
+      // 1. Always allow deselecting an already-picked item
+      if (current.includes(dishTitle)) {
+        return {
+          ...prev,
+          [sectionId]: current.filter((item) => item !== dishTitle),
+        };
+      }
+
+      // 2. Enforce dedicated cap OR shared `rules.limitProduct` pool
+      if (sectionLimit > 0) {
+        if (current.length >= sectionLimit) return prev;
+      } else if (pooledLimit > 0) {
+        const currentPoolCount = pooledChoiceSections.reduce(
+          (sum, sec) => sum + (prev[sec._id]?.length || 0),
+          0
+        );
+        if (currentPoolCount >= pooledLimit) return prev;
+      } else {
+        return prev;
+      }
+
+      // 3. Add selection
+      return {
+        ...prev,
+        [sectionId]: [...current, dishTitle],
+      };
+    });
+  };
 
   // Step 2 State: Table Styling & Nested Add-Ons
-  const [selectedPresentationId, setSelectedPresentationId] = useState<string>(
-    presentations[0]?._id || ""
-  );
+  const [selectedPresentationId, setSelectedPresentationId] = useState<string>("");
   const [selectedAddOns, setSelectedAddOns] = useState<SelectedAddOn[]>([]);
   const [addOnQuantities, setAddOnQuantities] = useState<Record<string, number>>(
     {}
@@ -166,14 +215,7 @@ export default function CateringBuilder({
     }
   }, [member]);
 
-  // Sync default presentation if presentations prop updates
-  useEffect(() => {
-    if (!selectedPresentationId && presentations.length > 0) {
-      setSelectedPresentationId(presentations[0]._id);
-    }
-  }, [presentations, selectedPresentationId]);
-
-  // Unified Mount Effect: Step 4 redirect handling & Step 3 sessionStorage restore
+  // Unified Mount Effect: Step 4 redirect handling & Step 3 OAuth return restore
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const stepParam = params.get("step");
@@ -184,37 +226,37 @@ export default function CateringBuilder({
       return;
     }
 
-    const savedDraft = sessionStorage.getItem(STORAGE_KEY);
-    if (savedDraft) {
-      try {
-        const draft = JSON.parse(savedDraft);
-        if (draft.selectedTierId) {
-          const matchedTier = tiers.find((t) => t._id === draft.selectedTierId);
-          if (matchedTier) setSelectedTier(matchedTier);
-        }
-        if (draft.pax) setPax(draft.pax);
-        if (draft.selectedCanapes) setSelectedCanapes(draft.selectedCanapes);
-        if (draft.selectedBeverages)
-          setSelectedBeverages(draft.selectedBeverages);
-        if (draft.selectedPresentationId)
-          setSelectedPresentationId(draft.selectedPresentationId);
-        if (draft.selectedAddOns) setSelectedAddOns(draft.selectedAddOns);
-        if (draft.eventDate) setEventDate(draft.eventDate);
-        if (draft.eventTime) setEventTime(draft.eventTime);
-        if (draft.contactName) setContactName(draft.contactName);
-        if (draft.contactEmail) setContactEmail(draft.contactEmail);
-        if (draft.contactPhone) setContactPhone(draft.contactPhone);
-        if (draft.postalCode) setPostalCode(draft.postalCode);
-        if (draft.addressLine1) setAddressLine1(draft.addressLine1);
-        if (draft.unitNumber) setUnitNumber(draft.unitNumber);
-        if (draft.deliveryNotes) setDeliveryNotes(draft.deliveryNotes);
-      } catch {
-        sessionStorage.removeItem(STORAGE_KEY);
-      }
-    }
-
+    // Only restore draft when returning from OAuth login to Step 3
     if (stepParam === "3") {
+      const savedDraft = sessionStorage.getItem(STORAGE_KEY);
+      if (savedDraft) {
+        try {
+          const draft = JSON.parse(savedDraft);
+          if (draft.selectedTierId) {
+            const matchedTier = tiers.find((t) => t._id === draft.selectedTierId);
+            if (matchedTier) setSelectedTier(matchedTier);
+          }
+          if (draft.pax) setPax(draft.pax);
+          if (draft.selectedPresentationId)
+            setSelectedPresentationId(draft.selectedPresentationId);
+          if (draft.selectedAddOns) setSelectedAddOns(draft.selectedAddOns);
+          if (draft.eventDate) setEventDate(draft.eventDate);
+          if (draft.eventTime) setEventTime(draft.eventTime);
+          if (draft.contactName) setContactName(draft.contactName);
+          if (draft.contactEmail) setContactEmail(draft.contactEmail);
+          if (draft.contactPhone) setContactPhone(draft.contactPhone);
+          if (draft.postalCode) setPostalCode(draft.postalCode);
+          if (draft.addressLine1) setAddressLine1(draft.addressLine1);
+          if (draft.unitNumber) setUnitNumber(draft.unitNumber);
+          if (draft.deliveryNotes) setDeliveryNotes(draft.deliveryNotes);
+        } catch {
+          sessionStorage.removeItem(STORAGE_KEY);
+        }
+      }
       setStep(3);
+    } else {
+      // Fresh visit to Step 1: clear any leftover draft from an earlier test
+      sessionStorage.removeItem(STORAGE_KEY);
     }
   }, [tiers]);
 
@@ -457,8 +499,7 @@ export default function CateringBuilder({
     const nextTierCats: string[] = tier?.collectionIds || [];
 
     setSelectedTier(tier);
-    setSelectedCanapes([]);
-    setSelectedBeverages([]);
+    setSelectedBySection({});
     setPax(nextRules.minPax);
 
     // Strip any previously selected add-ons that aren't allowed for the new tier's categories
@@ -508,24 +549,53 @@ export default function CateringBuilder({
 
   // Step 1 Validation
   const isPastDate = Boolean(eventDate && eventDate < minSelectableDate);
-  const isDateAvailable = eventDate.trim().length > 0 && !isPastDate && !activeBlackout;
+  const isDateAvailable =
+    eventDate.trim().length > 0 && !isPastDate && !activeBlackout;
   const isValidPax =
     pax >= rules.minPax &&
     pax <= rules.maxPax &&
     (pax - rules.minPax) % paxStep === 0;
   const isValidTime = eventTime >= rules.startTime && eventTime <= rules.endTime;
+
+  const activeSections: MenuSection[] = rules?.sections || [];
+  const isFixedMenuTier = activeSections.length === 0;
+
+  // 1. Sections with their own dedicated cap (e.g., Beverages = 1, Mains = 2)
+  const dedicatedChoiceSections = activeSections.filter(
+    (sec) => sec.selectionType === "choice" && sec.selectLimit > 0
+  );
+
+  // 2. Sections with selectLimit === 0 that share `rules.limitProduct` (e.g., 5 food tabs = 3 total)
+  const pooledChoiceSections = activeSections.filter(
+    (sec) => sec.selectionType === "choice" && sec.selectLimit === 0
+  );
+  const pooledLimit = rules?.limitProduct || 0;
+  const totalPooledSelected = pooledChoiceSections.reduce(
+    (sum, sec) => sum + (selectedBySection[sec._id]?.length || 0),
+    0
+  );
+
+  const areDedicatedComplete = dedicatedChoiceSections.every(
+    (sec) => (selectedBySection[sec._id]?.length || 0) === sec.selectLimit
+  );
+
+  const isPooledComplete =
+    pooledChoiceSections.length === 0 ||
+    pooledLimit === 0 ||
+    totalPooledSelected === pooledLimit;
+
   const isStep1Complete =
-    selectedCanapes.length === rules.limitProduct &&
-    selectedBeverages.length === rules.beverages &&
+    Boolean(selectedTier) &&
+    areDedicatedComplete &&
+    isPooledComplete &&
     isValidPax &&
     isValidTime &&
     isDateAvailable;
-    // eventDate.trim().length > 0;
 
   // Step 2 Selection & Validation
-  const activePresentation =
-    presentations.find((p) => p._id === selectedPresentationId) ||
-    presentations[0];
+  const activePresentation = presentations.find(
+    (p) => p._id === selectedPresentationId
+  );
   const isStep2Complete =
     presentations.length === 0 || Boolean(activePresentation);
 
@@ -706,8 +776,6 @@ export default function CateringBuilder({
         JSON.stringify({
           selectedTierId: selectedTier._id,
           pax,
-          selectedCanapes,
-          selectedBeverages,
           selectedPresentationId,
           selectedAddOns,
           eventDate,
@@ -751,6 +819,22 @@ export default function CateringBuilder({
       setLoading(false);
     }
   };
+
+  const resolvedMenuSelections = activeSections
+  .map((section) => {
+    const items =
+      section.selectionType === "fixed"
+        ? section.items.map((item) => item.title)
+        : selectedBySection[section._id] || [];
+    return {
+      sectionId: section._id,
+      title: section.title,
+      selectionType: section.selectionType,
+      selectLimit: section.selectLimit,
+      items,
+    };
+  })
+  .filter((group) => group.items.length > 0);
 
   const STEPS = [
     { num: 1 as const, label: "1. Menu & Event" },
@@ -802,13 +886,16 @@ export default function CateringBuilder({
           <div className="space-y-8 lg:col-span-8">
             {step === 1 && (
               <div className="space-y-8">
+                {/* 1. Package Tier Selector */}
                 <section>
-                  <h2 className="mb-3 text-xl font-bold">
-                    Choose Your Package Tier
-                  </h2>
+                  <h2 className="mb-3 text-xl font-bold">Choose Your Package Tier</h2>
                   <div className="grid grid-cols-1 gap-3 sm:grid-cols-3 md:grid-cols-5">
                     {tiers.map((tier) => {
                       const active = tier._id === selectedTier?._id;
+                      const thisTierRule = getRuleForTier(tier);
+                      const cardTitle =
+                        thisTierRule?.title?.trim() || tier.name.split("–")[0].trim();
+
                       return (
                         <button
                           key={tier._id}
@@ -820,9 +907,7 @@ export default function CateringBuilder({
                               : "border-gray-200 hover:border-gray-400"
                           }`}
                         >
-                          <div className="font-semibold">
-                            {tier.name.split("–")[0].trim()}
-                          </div>
+                          <div className="font-semibold">{cardTitle}</div>
                           <div className="mt-1 text-sm opacity-80">
                             {tier.priceData?.formatted?.price} / pax
                           </div>
@@ -832,107 +917,152 @@ export default function CateringBuilder({
                   </div>
                 </section>
 
-                <section>
-                  <div className="mb-3 flex items-center justify-between">
-                    <h2 className="text-xl font-bold">Select Canapés</h2>
-                    <span className="rounded-full bg-gray-100 px-3 py-1 text-sm font-medium">
-                      {selectedCanapes.length} / {rules.limitProduct} selected
-                    </span>
-                  </div>
-                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                    {canapeList.map((dish) => {
-                      const checked = selectedCanapes.includes(dish.title);
-                      const disabled =
-                        !checked &&
-                        selectedCanapes.length >= rules.limitProduct;
-                      return (
-                        <button
-                          key={dish._id}
-                          type="button"
-                          disabled={disabled}
-                          onClick={() =>
-                            toggleDish(
-                              dish.title,
-                              selectedCanapes,
-                              setSelectedCanapes,
-                              rules.limitProduct
-                            )
-                          }
-                          className={`flex cursor-pointer items-start justify-between rounded-lg border p-4 text-left transition ${
-                            checked
-                              ? "border-black bg-gray-50 ring-1 ring-black"
-                              : disabled
-                              ? "cursor-not-allowed border-gray-100 opacity-40"
-                              : "border-gray-200 hover:border-gray-400"
-                          }`}
-                        >
-                          <div>
-                            <div className="font-medium">{dish.title}</div>
-                            {dish.description && (
-                              <div className="mt-0.5 text-xs text-gray-500">
-                                {dish.description}
-                              </div>
-                            )}
-                          </div>
-                          <span className="ml-2 text-lg font-bold">
-                            {checked ? "✓" : "+"}
-                          </span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </section>
+                {/* 2. Curated Spread Notice (e.g., Grazing Table where activeSections is empty) */}
+                {isFixedMenuTier && selectedTier && (
+                  <section className="rounded-xl border border-gray-200 bg-gray-50 p-5">
+                    <h3 className="text-base font-semibold text-gray-900">
+                      Curated Spread Included
+                    </h3>
+                    <p className="mt-1 text-sm text-gray-600">
+                      {rules?.description ||
+                        "This package comes as a complete, chef-curated spread sized to your guest count. No individual item selection is required."}
+                    </p>
+                  </section>
+                )}
 
-                <section>
-                  <div className="mb-3 flex items-center justify-between">
-                    <h2 className="text-xl font-bold">Select Beverages</h2>
-                    <span className="rounded-full bg-gray-100 px-3 py-1 text-sm font-medium">
-                      {selectedBeverages.length} / {rules.beverages} selected
-                    </span>
-                  </div>
-                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                    {beverageList.map((dish) => {
-                      const checked = selectedBeverages.includes(dish.title);
-                      const disabled =
-                        !checked &&
-                        selectedBeverages.length >= rules.beverages;
-                      return (
-                        <button
-                          key={dish._id}
-                          type="button"
-                          disabled={disabled}
-                          onClick={() =>
-                            toggleDish(
-                              dish.title,
-                              selectedBeverages,
-                              setSelectedBeverages,
-                              rules.beverages
-                            )
-                          }
-                          className={`flex cursor-pointer items-start justify-between rounded-lg border p-4 text-left transition ${
-                            checked
-                              ? "border-black bg-gray-50 ring-1 ring-black"
-                              : disabled
-                              ? "cursor-not-allowed border-gray-100 opacity-40"
-                              : "border-gray-200 hover:border-gray-400"
-                          }`}
-                        >
-                          <div>
-                            <div className="font-medium">{dish.title}</div>
-                            {dish.description && (
-                              <div className="mt-0.5 text-xs text-gray-500">
-                                {dish.description}
-                              </div>
-                            )}
-                          </div>
-                          <span className="ml-2 text-lg font-bold">
-                            {checked ? "✓" : "+"}
+                {/* 3. Dynamic Menu Sections (Fixed & Choice Courses) */}
+                {activeSections.map((section) => {
+                  const isFixed = section.selectionType === "fixed";
+                  const isPooled = !isFixed && section.selectLimit === 0;
+                  const selectedItems = selectedBySection[section._id] || [];
+
+                  return (
+                    <section key={section._id}>
+                      <div className="mb-3 flex items-center justify-between gap-4">
+                        <div>
+                          <h2 className="text-xl font-bold">{section.title}</h2>
+                          {section.description && (
+                            <p className="mt-0.5 text-sm text-gray-500">
+                              {section.description}
+                            </p>
+                          )}
+                        </div>
+
+                        {isFixed ? (
+                          <span className="shrink-0 rounded-full bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-700">
+                            Included in Package
                           </span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </section>
+                        ) : isPooled ? (
+                          <span className="shrink-0 rounded-full bg-gray-100 px-3 py-1 text-sm font-medium">
+                            {selectedItems.length} picked ({totalPooledSelected} / {pooledLimit} total)
+                          </span>
+                        ) : (
+                          <span className="shrink-0 rounded-full bg-gray-100 px-3 py-1 text-sm font-medium">
+                            {selectedItems.length} / {section.selectLimit} selected
+                          </span>
+                        )}
+                      </div>
+
+                      {section.items.length === 0 ? (
+                        <p className="rounded-lg border border-dashed border-gray-200 p-4 text-sm text-gray-500">
+                          No dishes assigned to this section yet.
+                        </p>
+                      ) : (
+                        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                          {section.items.map((dish) => {
+                            if (isFixed) {
+                              return (
+                                <div
+                                  key={dish._id}
+                                  className="flex items-start justify-between rounded-lg border border-gray-200 bg-gray-50/70 p-4"
+                                >
+                                  <div>
+                                    <div className="font-medium text-gray-900">
+                                      {dish.title}
+                                    </div>
+                                    {dish.description && (
+                                      <div className="mt-0.5 text-xs text-gray-500">
+                                        {dish.description}
+                                      </div>
+                                    )}
+                                    {dish.dietaryTags && dish.dietaryTags.length > 0 && (
+                                      <div className="mt-2 flex flex-wrap gap-1">
+                                        {dish.dietaryTags.map((tag) => (
+                                          <span
+                                            key={tag}
+                                            className="rounded bg-white px-2 py-0.5 text-[11px] font-medium text-gray-600 ring-1 ring-gray-200"
+                                          >
+                                            {tag}
+                                          </span>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </div>
+                                  <span className="ml-2 text-sm font-semibold text-emerald-600">
+                                    ✓
+                                  </span>
+                                </div>
+                              );
+                            }
+
+                            const checked = selectedItems.includes(dish.title);
+                            const disabled =
+                              !checked &&
+                              (isPooled
+                                ? totalPooledSelected >= pooledLimit
+                                : selectedItems.length >= section.selectLimit);
+
+                            return (
+                              <button
+                                key={dish._id}
+                                type="button"
+                                disabled={disabled}
+                                onClick={() =>
+                                  toggleSectionItem(
+                                    section._id,
+                                    dish.title,
+                                    section.selectLimit
+                                  )
+                                }
+                                className={`flex cursor-pointer items-start justify-between rounded-lg border p-4 text-left transition ${
+                                  checked
+                                    ? "border-black bg-gray-50 ring-1 ring-black"
+                                    : disabled
+                                    ? "cursor-not-allowed border-gray-100 opacity-40"
+                                    : "border-gray-200 hover:border-gray-400"
+                                }`}
+                              >
+                                <div>
+                                  <div className="font-medium">{dish.title}</div>
+                                  {dish.description && (
+                                    <div className="mt-0.5 text-xs text-gray-500">
+                                      {dish.description}
+                                    </div>
+                                  )}
+                                  {dish.dietaryTags && dish.dietaryTags.length > 0 && (
+                                    <div className="mt-2 flex flex-wrap gap-1">
+                                      {dish.dietaryTags.map((tag) => (
+                                        <span
+                                          key={tag}
+                                          className="rounded bg-gray-100 px-2 py-0.5 text-[11px] font-medium text-gray-600"
+                                        >
+                                          {tag}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                                <span className="ml-2 text-lg font-bold">
+                                  {checked ? "✓" : "+"}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </section>
+                  );
+                })}
               </div>
             )}
 
@@ -1636,6 +1766,40 @@ export default function CateringBuilder({
                       )}
                     </div>
                   </div>
+                  <section>
+                    <h2 className="mb-3 text-xl font-bold">
+                      Choose Your Package Tier
+                    </h2>
+                    <div className="grid grid-cols-1 gap-3">
+                      {tiers.map((tier) => {
+                        const active = tier._id === selectedTier?._id;
+                        // Call your rule resolver for THIS specific `tier`, not `selectedTier`
+                        const thisTierRule = getRuleForTier(tier);
+                        const cardTitle =
+                          thisTierRule?.title?.trim() || tier.name.split("–")[0].trim();
+
+                        return (
+                          <button
+                            key={tier._id}
+                            type="button"
+                            onClick={() => handleTierChange(tier)}
+                            className={`cursor-pointer flex rounded-xl border p-4 text-left transition ${
+                              active
+                                ? "border-black bg-black text-white"
+                                : "border-gray-200 hover:border-gray-400"
+                            }`}
+                          >
+                            <div className="font-semibold">
+                              {cardTitle}
+                            </div>
+                            <div className="mt-1 text-sm opacity-80">
+                              {tier.priceData?.formatted?.price} / pax
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </section>
                 </div>
               )}
 
@@ -1671,37 +1835,25 @@ export default function CateringBuilder({
                   </div>
                 </div>
 
-                {/* 3. Selected Menu Dishes (Canapés & Beverages) */}
-                {(selectedCanapes.length > 0 ||
-                  selectedBeverages.length > 0) && (
+                {/* 3. Selected & Included Menu Dishes */}
+                {resolvedMenuSelections.length > 0 && (
                   <div className="space-y-2 border-t border-gray-100 pt-3">
-                    {selectedCanapes.length > 0 && (
-                      <div>
+                    {resolvedMenuSelections.map((group) => (
+                      <div key={group.sectionId}>
                         <p className="text-xs font-semibold uppercase tracking-wider text-gray-400">
-                          Canapés ({selectedCanapes.length}/
-                          {rules.limitProduct})
+                          {group.title} (
+                          {group.selectionType === "fixed"
+                            ? "Included"
+                            : `${group.items.length}/${group.selectLimit}`}
+                          )
                         </p>
                         <ul className="mt-1 space-y-0.5 text-xs text-gray-700">
-                          {selectedCanapes.map((c) => (
-                            <li key={c}>• {c}</li>
+                          {group.items.map((item) => (
+                            <li key={item}>• {item}</li>
                           ))}
                         </ul>
                       </div>
-                    )}
-
-                    {selectedBeverages.length > 0 && (
-                      <div>
-                        <p className="text-xs font-semibold uppercase tracking-wider text-gray-400">
-                          Beverages ({selectedBeverages.length}/
-                          {rules.beverages})
-                        </p>
-                        <ul className="mt-1 space-y-0.5 text-xs text-gray-700">
-                          {selectedBeverages.map((b) => (
-                            <li key={b}>• {b}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
+                    ))}
                   </div>
                 )}
 
@@ -1785,24 +1937,41 @@ export default function CateringBuilder({
                 </div>
 
                 {/* Quick Step CTA inside Sidebar */}
-                {step === 1 && (
-                  <button
-                    type="button"
-                    disabled={!isStep1Complete}
-                    onClick={() => setStep(2)}
-                    className="mt-2 w-full cursor-pointer rounded-lg bg-black px-6 py-3 font-semibold text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:bg-gray-300"
-                  >
-                    {isStep1Complete
-                      ? "Next: Presentation & Add-Ons →"
-                      : !eventDate
-                      ? "Select Event Date"
-                      : isPastDate || activeBlackout
-                      ? "Selected Date Unavailable"
-                      : `Pick ${rules.limitProduct - selectedCanapes.length} canapé(s) & ${
-                          rules.beverages - selectedBeverages.length
-                        } drink(s)`}
-                  </button>
-                )}
+                {step === 1 && (() => {
+                  const missingParts: string[] = [];
+
+                  const remainingPooled = pooledLimit - totalPooledSelected;
+                  if (pooledChoiceSections.length > 0 && remainingPooled > 0) {
+                    missingParts.push(`${remainingPooled} food item(s)`);
+                  }
+
+                  dedicatedChoiceSections.forEach((sec) => {
+                    const remaining =
+                      sec.selectLimit - (selectedBySection[sec._id]?.length || 0);
+                    if (remaining > 0) {
+                      missingParts.push(`${remaining} ${sec.title.toLowerCase()}`);
+                    }
+                  });
+
+                  return (
+                    <button
+                      type="button"
+                      disabled={!isStep1Complete}
+                      onClick={() => setStep(2)}
+                      className="mt-2 w-full cursor-pointer rounded-lg bg-black px-6 py-3 font-semibold text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:bg-gray-300"
+                    >
+                      {isStep1Complete
+                        ? "Next: Presentation & Add-Ons →"
+                        : !eventDate
+                        ? "Select Event Date"
+                        : isPastDate || activeBlackout
+                        ? "Selected Date Unavailable"
+                        : missingParts.length > 0
+                        ? `Pick ${missingParts.join(" & ")}`
+                        : "Complete Event Details"}
+                    </button>
+                  );
+                })()}
 
                 {step === 2 && (
                   <button
@@ -1811,7 +1980,9 @@ export default function CateringBuilder({
                     onClick={() => setStep(3)}
                     className="w-full cursor-pointer rounded-lg bg-black py-2.5 text-xs font-semibold text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:bg-gray-300"
                   >
-                    Continue to Address &amp; Payment →
+                    {isStep2Complete
+                      ? "Next: Address & Payment →"
+                      : "Select Table Presentation"}
                   </button>
                 )}
               </div>

@@ -798,14 +798,14 @@ export default function CateringBuilder({
         });
       }
 
-      // 4. Add CMS Add-Ons + Service Charge (10%) + GST (9%) as whole dollars ($1) + cents ($0.01)
+      // 4. Add CMS Add-Ons + Delivery & Teardown Fee + Service Charge (10%) + GST (9%) as whole dollars ($1) + cents ($0.01)
       const customDollarProductId =
         process.env.NEXT_PUBLIC_WIX_CUSTOM_DOLLAR_PRODUCT_ID;
       const customCentProductId =
         process.env.NEXT_PUBLIC_WIX_CUSTOM_ADDON_PRODUCT_ID;
 
       const totalCents = Math.round(
-        (cmsAddOnsSubtotal + serviceCharge + gstAmount) * 100
+        (cmsAddOnsSubtotal + serviceCharge + gstAmount + deliveryFee) * 100
       );
       const wholeDollars = Math.floor(totalCents / 100);
       const remainingCents = totalCents % 100;

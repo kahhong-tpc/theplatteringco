@@ -16,6 +16,28 @@ export interface MemberProfileData {
   };
 }
 
+function normalizeToE164(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  // Strip spaces, dashes, and parentheses
+  const cleaned = trimmed.replace(/[\s\-()]/g, "");
+
+  // Valid international E.164: '+' followed by 7 to 15 digits (country code cannot start with 0)
+  if (/^\+[1-9]\d{6,14}$/.test(cleaned)) {
+    return cleaned;
+  }
+
+  // Convenience fallback for bare 8-digit Singapore numbers (starting with 3, 6, 8, or 9)
+  if (/^[3689]\d{7}$/.test(cleaned)) {
+    return `+65${cleaned}`;
+  }
+
+  throw new Error(
+    "Please include a '+' and country code for your phone number (e.g. +65 8240 9532)."
+  );
+}
+
 /**
  * 1. Register a new member with custom UI (Email + Password + Profile Attributes)
  */
@@ -153,6 +175,9 @@ export async function fetchCurrentMemberProfile(): Promise<MemberProfileData | n
 /**
  * 5. Update Member Profile Attributes (Name, Phone, Company, Default SG Address)
  */
+/**
+ * 5. Update Member Profile Attributes (Name, Phone, Company, Default SG Address)
+ */
 export async function updateMemberProfile(
   memberId: string,
   updates: {
@@ -167,11 +192,13 @@ export async function updateMemberProfile(
     };
   }
 ) {
+  const formattedPhone = normalizeToE164(updates.phone || "");
+
   const updated = await wixClient.members.updateMember(memberId, {
     contact: {
       firstName: updates.firstName.trim(),
       lastName: updates.lastName.trim(),
-      phones: updates.phone.trim() ? [updates.phone.trim()] : [],
+      phones: formattedPhone ? [formattedPhone] : [],
       company: updates.company?.trim() || "",
       addresses: updates.defaultAddress?.addressLine1
         ? [

@@ -66,10 +66,11 @@ function minutesToTime(totalMinutes: number): string {
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
-// Generate 30-min time slots from (eventTime - 3 hrs) up to eventTime inclusive
+// Generate 30-min time slots from max(08:00, eventTime - 2 hrs) up to eventTime inclusive
 function getAllowedBarStartTimes(eventTime: string): string[] {
-  const endMins = timeToMinutes(eventTime || "12:00");
-  const startMins = Math.max(0, endMins - 180);
+  const earliestAllowedMins = 8 * 60; // 08:00 floor
+  const endMins = Math.max(earliestAllowedMins, timeToMinutes(eventTime || "12:00"));
+  const startMins = Math.max(earliestAllowedMins, endMins - 120);
   const slots: string[] = [];
 
   for (let m = startMins; m <= endMins; m += 30) {

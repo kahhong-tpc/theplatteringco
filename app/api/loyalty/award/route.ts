@@ -6,27 +6,44 @@ import { awardPointsForOrder } from "@/lib/loyalty";
 
 export async function POST(req: NextRequest) {
   try {
-    const serverWixClient = await getServerWixClient();
-    if (!serverWixClient.auth.loggedIn()) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-
-    const { member } = await serverWixClient.members.getCurrentMember();
-    if (!member?._id) {
-      return NextResponse.json({ error: "Member not found" }, { status: 404 });
-    }
-
     const body = await req.json();
     const {
       checkoutId,
       orderId,
+      memberId: bodyMemberId = "",
       fallbackTotal,
       name: bodyName = "",
       email: bodyEmail = "",
     } = body;
 
-    const referenceId = orderId || checkoutId;
+    // 1. Try active session member first, then fall back to verified memberId from checkout draft
+    let resolvedMember: any = null;
+    try {
+      const serverWixClient = await getServerWixClient();
+      if (serverWixClient.auth.loggedIn()) {
+        const res = await serverWixClient.members.getCurrentMember();
+        resolvedMember = res?.member || null;
+      }
+    } catch (authErr) {
+      console.warn("[loyalty/award] Session auth lookup failed, trying fallback memberId:", authErr);
+    }
 
+    if (!resolvedMember?._id && bodyMemberId) {
+      try {
+        const memberRes = await wixAdminClient.members.getMember(
+          String(bodyMemberId).trim()
+        );
+        resolvedMember = (memberRes as any)?.member || memberRes || null;
+      } catch (memberErr) {
+        console.warn("[loyalty/award] Admin getMember fallback failed:", memberErr);
+      }
+    }
+
+    if (!resolvedMember?._id) {
+      return NextResponse.json({ error: "Unauthorized / Member not found" }, { status: 401 });
+    }
+
+    const referenceId = orderId || checkoutId;
     if (!referenceId) {
       return NextResponse.json(
         { error: "Missing checkoutId or orderId" },
@@ -37,11 +54,9 @@ export async function POST(req: NextRequest) {
     let totalPaid = Number(fallbackTotal) || 0;
     let orderNumber: string | undefined;
 
-    // Priority 1: Name & Email submitted in Step 3 form (passed from CateringBuilder)
     let email = String(bodyEmail || "").trim();
     let name = String(bodyName || "").trim();
 
-    // Priority 2: Verified details from Wix Order (if orderId is provided)
     if (orderId) {
       try {
         const order = await wixAdminClient.orders.getOrder(orderId);
@@ -62,7 +77,6 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // Priority 3: Checkout buyer/billing details (when redirected with checkoutId)
     if (checkoutId && (!email || !name)) {
       try {
         const checkoutMod = (wixAdminClient as any).checkout;
@@ -92,26 +106,17 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // Priority 4: Logged-in Wix Member profile fallback
-    email ||= member.loginEmail?.trim() || "";
+    email ||= resolvedMember.loginEmail?.trim() || "";
     name ||=
-      [member.contact?.firstName, member.contact?.lastName]
+      [resolvedMember.contact?.firstName, resolvedMember.contact?.lastName]
         .filter(Boolean)
         .join(" ")
         .trim() ||
-      member.profile?.nickname?.trim() ||
+      resolvedMember.profile?.nickname?.trim() ||
       "";
 
-    console.log("[loyalty/award] Resolved member & buyer details:", {
-      memberId: member._id,
-      referenceId,
-      fromBody: { name: bodyName, email: bodyEmail },
-      finalResolved: { name, email, totalPaid },
-      capturedBoth: Boolean(name && email),
-    });
-
     const result = await awardPointsForOrder({
-      memberId: member._id,
+      memberId: resolvedMember._id,
       name,
       email,
       orderId: referenceId,

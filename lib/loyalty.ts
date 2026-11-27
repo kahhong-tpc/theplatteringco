@@ -102,8 +102,19 @@ export async function awardPointsForOrder({
     .find();
 
   if (existingTx.items.length > 0) {
+    const existingAccountRes = await wixAdminClient.items
+      .query("LoyaltyAccounts")
+      .eq("memberId", memberId)
+      .find();
+    const acct = existingAccountRes.items[0];
+    const priorPoints = Number(existingTx.items[0]?.points) || pointsEarned;
+
     return {
       awarded: false,
+      duplicate: true,
+      pointsEarned: priorPoints,
+      newBalance: Number(acct?.pointsBalance) || priorPoints,
+      tier: acct?.tier || calculateLoyaltyTier(priorPoints),
       reason: "Points already awarded for this order",
     };
   }

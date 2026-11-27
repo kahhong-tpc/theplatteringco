@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { wixClient } from "@/lib/wixClient";
 import { TierRule, PresentationOption } from "@/lib/catering";
 import Step2AddOns, { SelectedAddOn } from "@/components/addon/addon";
@@ -82,6 +82,9 @@ export default function CateringBuilder({
   blackoutDates?: BlackoutDateRule[];
   rulesByProductId?: Record<string, TierRule>;
 }) {
+  //Delivery and Teardown Price
+  const DELIVERY_TEARDOWN_FEE = 90;
+
   // Match Store Product name against CMS title (longest-first prevents partial collisions)
   const getRuleForTier = (tier: any): TierRule => {
     if (!tier) return DEFAULT_RULE;
@@ -127,10 +130,6 @@ export default function CateringBuilder({
   const [eventDate, setEventDate] = useState<string>("");
   const [eventTime, setEventTime] = useState<string>("12:00");
   const [isDatePickerOpen, setIsDatePickerOpen] = useState(false);
-  const [calendarMonth, setCalendarMonth] = useState(() => {
-    const now = new Date();
-    return new Date(now.getFullYear(), now.getMonth(), 1);
-  });
   const [selectedBySection, setSelectedBySection] = useState<
     Record<string, string[]>
   >({});
@@ -260,7 +259,10 @@ export default function CateringBuilder({
     }
   }, [tiers]);
 
-  // Award Loyalty Points on Step 4 Return
+
+  const step4ProcessedRef = useRef<string | null>(null);
+
+  // Record Order & Award Loyalty Points on Step 4 Return
   useEffect(() => {
     if (typeof window === "undefined") return;
 
@@ -269,45 +271,115 @@ export default function CateringBuilder({
     const checkoutId = params.get("checkoutId");
     const urlTotal = Number(params.get("total") || 0);
 
-    if (currentStep !== "4" || !checkoutId || urlTotal <= 0 || !isLoggedIn) {
+    if (currentStep !== "4" || !checkoutId) {
       return;
     }
 
-    // Read draft contact details (or member profile) before/after redirect
-    let draftName = contactName;
-    let draftEmail = contactEmail;
+    let draft: any = {};
     try {
       const raw = sessionStorage.getItem(STORAGE_KEY);
       if (raw) {
-        const parsed = JSON.parse(raw);
-        draftName ||= parsed.contactName || "";
-        draftEmail ||= parsed.contactEmail || "";
+        draft = JSON.parse(raw);
       }
     } catch {}
 
-    const finalName =
-      draftName ||
-      `${member?.firstName || ""} ${member?.lastName || ""}`.trim();
-    const finalEmail = draftEmail || member?.email || "";
+    const resolvedMemberId = String(member?._id || draft.memberId || "").trim();
 
-    fetch("/api/loyalty/award", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        checkoutId,
-        fallbackTotal: urlTotal,
-        name: finalName,
-        email: finalEmail,
-      }),
-    })
-      .then((res) => res.json())
-      .then((data) => {
-        sessionStorage.removeItem(STORAGE_KEY);
-        if (data?.awarded) {
-          setLoyaltyAward(data);
+    // Wait for member hydration if logged in and memberId is not yet in draft
+    if (isLoggedIn && !resolvedMemberId) {
+      return;
+    }
+
+    if (step4ProcessedRef.current === checkoutId) return;
+    step4ProcessedRef.current = checkoutId;
+
+    const finalName =
+      draft.contactName ||
+      contactName ||
+      `${member?.firstName || ""} ${member?.lastName || ""}`.trim();
+    const finalEmail = draft.contactEmail || contactEmail || member?.email || "";
+    const finalTotal = Number(draft.grandTotal || urlTotal || 0);
+
+    async function finalizeStep4Order() {
+      let earnedPoints = 0;
+
+      // 1. Award loyalty points if logged in or draft has a memberId
+      if ((isLoggedIn || Boolean(resolvedMemberId)) && finalTotal > 0) {
+        try {
+          const loyaltyRes = await fetch("/api/loyalty/award", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              checkoutId,
+              memberId: resolvedMemberId,
+              fallbackTotal: finalTotal,
+              name: finalName,
+              email: finalEmail,
+            }),
+          });
+          const loyaltyData = await loyaltyRes.json();
+
+          if (loyaltyRes.ok && loyaltyData) {
+            earnedPoints = Number(
+              loyaltyData.pointsEarned ??
+                loyaltyData.points ??
+                Math.floor(finalTotal)
+            );
+            setLoyaltyAward({
+              ...loyaltyData,
+              awarded: true,
+              pointsEarned: earnedPoints,
+            });
+          } else {
+            console.error("Loyalty award failed:", loyaltyData);
+          }
+        } catch (err) {
+          console.error("Loyalty award error:", err);
         }
-      })
-      .catch((err) => console.error("Loyalty award error:", err));
+      }
+
+      // 2. Save full catering order record to Wix CMS (deduped by checkoutId in /api/orders)
+      if (finalEmail) {
+        try {
+          await fetch("/api/orders", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              checkoutId,
+              memberId: resolvedMemberId,
+              customerEmail: finalEmail,
+              customerName: finalName,
+              customerPhone: draft.contactPhone || contactPhone || "",
+              packageTitle: draft.packageTitle || "",
+              pax: Number(draft.pax || 0),
+              eventDate: draft.eventDate || "",
+              eventTime: draft.eventTime || "",
+              deliveryAddress: draft.deliveryAddress || "",
+              menuSelections: Array.isArray(draft.menuSelections)
+                ? draft.menuSelections
+                : [],
+              presentationTitle: draft.presentationTitle || "",
+              addOnsSummary: Array.isArray(draft.addOnsSummary)
+                ? draft.addOnsSummary
+                : [],
+              subtotal: Number(draft.subtotal || 0),
+              deliveryFee: Number(draft.deliveryFee ?? DELIVERY_TEARDOWN_FEE),
+              serviceCharge: Number(draft.serviceCharge || 0),
+              gstAmount: Number(draft.gstAmount || 0),
+              grandTotal: finalTotal,
+              pointsEarned: earnedPoints,
+              status: "Confirmed",
+            }),
+          });
+        } catch (err) {
+          console.error("Order recording error:", err);
+        }
+      }
+
+      sessionStorage.removeItem(STORAGE_KEY);
+    }
+
+    finalizeStep4Order();
   }, [isLoggedIn, member]);
 
   // Singapore 6-Digit Postal Code Lookup
@@ -425,10 +497,25 @@ export default function CateringBuilder({
     return Math.min(max, Math.max(min, snapped));
   };
 
-  // Local YYYY-MM-DD (avoids UTC off-by-one shifts in Singapore UTC+8)
+    // Local YYYY-MM-DD (avoids UTC off-by-one shifts in Singapore UTC+8)
   const minSelectableDate = useMemo(() => {
-    return formatLocalDate(new Date());
+    const sgTodayStr = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Singapore",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date());
+
+    const [y, m, d] = sgTodayStr.split("-").map(Number);
+    return new Date(Date.UTC(y, m - 1, d + 3)).toISOString().slice(0, 10);
   }, []);
+
+
+  const [calendarMonth, setCalendarMonth] = useState(() => {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth(), 1);
+  });
+  
 
   const getBlackoutForDate = (date: string) => {
     const tierCats: string[] = selectedTier?.collectionIds || [];
@@ -628,11 +715,34 @@ export default function CateringBuilder({
     (sum, item) => sum + item.lineTotal,
     0
   );
-  const grandTotal =
+
+  // Singapore F&B Standard: 10% Service Charge, then 9% GST on (Subtotal + Service Charge)
+  const deliveryFee = DELIVERY_TEARDOWN_FEE;
+  const preTaxSubtotal =
     packageSubtotal +
     presentationPrice +
     legacyAddOnsSubtotal +
     cmsAddOnsSubtotal;
+
+  const serviceCharge = Number(((preTaxSubtotal + deliveryFee) * 0.1 ).toFixed(2));
+  const gstAmount = Number(
+    ((preTaxSubtotal + serviceCharge + deliveryFee) * 0.09).toFixed(2)
+  );
+  const grandTotal = Number(
+    (preTaxSubtotal + serviceCharge + deliveryFee + gstAmount).toFixed(2)
+  );
+
+  const minEventDate = useMemo(() => {
+    const sgTodayStr = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Singapore",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date());
+
+    const [y, m, d] = sgTodayStr.split("-").map(Number);
+    return new Date(Date.UTC(y, m - 1, d + 3)).toISOString().slice(0, 10);
+  }, []);
 
   // Step 3 -> Step 4: Create Direct Checkout & Redirect to Wix Payment
   const handleProceedToPayment = async (asGuest: boolean) => {
@@ -688,29 +798,47 @@ export default function CateringBuilder({
         });
       }
 
-      // 4. Add CMS Add-Ons as a separate line item (using the Catering Add-Ons $1 product)
-      const customAddOnProductId =
+      // 4. Add CMS Add-Ons + Service Charge (10%) + GST (9%) as whole dollars ($1) + cents ($0.01)
+      const customDollarProductId =
+        process.env.NEXT_PUBLIC_WIX_CUSTOM_DOLLAR_PRODUCT_ID;
+      const customCentProductId =
         process.env.NEXT_PUBLIC_WIX_CUSTOM_ADDON_PRODUCT_ID;
 
-      const addOnsDollarQty = resolvedSelectedAddOns.reduce(
-        (sum, addOn) =>
-          addOn.lineTotal > 0 ? sum + Math.round(addOn.lineTotal) : sum,
-        0
+      const totalCents = Math.round(
+        (cmsAddOnsSubtotal + serviceCharge + gstAmount) * 100
       );
+      const wholeDollars = Math.floor(totalCents / 100);
+      const remainingCents = totalCents % 100;
 
-      if (addOnsDollarQty > 0) {
-        if (!customAddOnProductId) {
+      if (wholeDollars > 0) {
+        if (!customDollarProductId) {
           throw new Error(
-            "Missing NEXT_PUBLIC_WIX_CUSTOM_ADDON_PRODUCT_ID for add-on checkout."
+            "Missing NEXT_PUBLIC_WIX_CUSTOM_DOLLAR_PRODUCT_ID for checkout."
           );
         }
 
         lineItems.push({
           catalogReference: {
             appId: WIX_STORES_APP_ID,
-            catalogItemId: customAddOnProductId,
+            catalogItemId: customDollarProductId,
           },
-          quantity: addOnsDollarQty,
+          quantity: wholeDollars,
+        });
+      }
+
+      if (remainingCents > 0) {
+        if (!customCentProductId) {
+          throw new Error(
+            "Missing NEXT_PUBLIC_WIX_CUSTOM_ADDON_PRODUCT_ID for checkout."
+          );
+        }
+
+        lineItems.push({
+          catalogReference: {
+            appId: WIX_STORES_APP_ID,
+            catalogItemId: customCentProductId,
+          },
+          quantity: remainingCents,
         });
       }
 
@@ -763,21 +891,61 @@ export default function CateringBuilder({
         throw new Error("Failed to create Cart V2.");
       }
 
-      const exactCheckoutTotal = Math.round(grandTotal);
+      const exactCheckoutTotal = grandTotal.toFixed(2);
 
       const returnUrl = new URL(window.location.href);
       returnUrl.searchParams.set("step", "4");
       returnUrl.searchParams.set("checkoutId", createdCart._id);
-      returnUrl.searchParams.set("total", String(exactCheckoutTotal));
+      returnUrl.searchParams.set("total", exactCheckoutTotal);
+
+      const structuredAddOns = [
+        ...resolvedSelectedAddOns.map((item) => ({
+          groupTitle: item.groupTitle,
+          optionTitle: item.optionTitle,
+          quantity: item.quantity,
+          pricingType: item.pricingType,
+          unitPrice: item.unitPrice,
+          lineTotal: item.lineTotal,
+          pickedDetails: item.pickedDetails || undefined,
+          isFreeFlowBar: item.isFreeFlowBar,
+          barPax: item.barPax,
+          barHours: item.barHours,
+          barStartTime: item.barStartTime,
+        })),
+        ...legacyActiveAddOns.map((item) => ({
+          groupTitle: "Add-On",
+          optionTitle: item.name,
+          quantity: item.quantity,
+          pricingType: "fixed",
+          unitPrice: item.price,
+          lineTotal: item.lineTotal,
+        })),
+      ];
+
+      const packageTitle =
+        rules?.title?.trim() || selectedTier.name.split("–")[0].trim();
+
+      const deliveryAddress = [
+        addressLine1.trim(),
+        unitNumber.trim(),
+        postalCode.trim() ? `Singapore ${postalCode.trim()}` : "",
+      ]
+        .filter(Boolean)
+        .join(", ");
 
       // Save current selections before leaving Next.js
       sessionStorage.setItem(
         STORAGE_KEY,
         JSON.stringify({
           selectedTierId: selectedTier._id,
+          memberId: member?._id || "",
+          packageTitle,
           pax,
           selectedPresentationId,
+          presentationTitle: activePresentation?.title || "",
           selectedAddOns,
+          addOnsSummary: structuredAddOns,
+          menuSelections: resolvedMenuSelections,
           eventDate,
           eventTime,
           contactName,
@@ -786,7 +954,13 @@ export default function CateringBuilder({
           postalCode,
           addressLine1,
           unitNumber,
+          deliveryAddress,
           deliveryNotes,
+          subtotal: preTaxSubtotal,
+          serviceCharge,
+          deliveryFee,
+          gstAmount,
+          grandTotal,
         })
       );
 
@@ -887,7 +1061,7 @@ export default function CateringBuilder({
             {step === 1 && (
               <div className="space-y-8">
                 {/* 1. Package Tier Selector */}
-                <section>
+                {/* <section>
                   <h2 className="mb-3 text-xl font-bold">Choose Your Package Tier</h2>
                   <div className="grid grid-cols-1 gap-3 sm:grid-cols-3 md:grid-cols-5">
                     {tiers.map((tier) => {
@@ -915,7 +1089,7 @@ export default function CateringBuilder({
                       );
                     })}
                   </div>
-                </section>
+                </section> */}
 
                 {/* 2. Curated Spread Notice (e.g., Grazing Table where activeSections is empty) */}
                 {isFixedMenuTier && selectedTier && (
@@ -1712,7 +1886,7 @@ export default function CateringBuilder({
                                     title={
                                       blackout?.reason ||
                                       (date < minSelectableDate
-                                        ? "Past dates are unavailable"
+                                        ? "Requires at least 3 days advance notice"
                                         : undefined)
                                     }
                                     onClick={() => {
@@ -1839,13 +2013,10 @@ export default function CateringBuilder({
                 {resolvedMenuSelections.length > 0 && (
                   <div className="space-y-2 border-t border-gray-100 pt-3">
                     {resolvedMenuSelections.map((group) => (
+                      console.log("Rendering group:", group),
                       <div key={group.sectionId}>
                         <p className="text-xs font-semibold uppercase tracking-wider text-gray-400">
-                          {group.title} (
-                          {group.selectionType === "fixed"
-                            ? "Included"
-                            : `${group.items.length}/${group.selectLimit}`}
-                          )
+                          {group.title}
                         </p>
                         <ul className="mt-1 space-y-0.5 text-xs text-gray-700">
                           {group.items.map((item) => (
@@ -1920,6 +2091,33 @@ export default function CateringBuilder({
                     ))}
                   </div>
                 )}
+
+                <div className="flex justify-between border-t border-gray-100 pt-2">
+                  <dt className="text-gray-600">Subtotal</dt>
+                  <dd className="font-medium">
+                    ${preTaxSubtotal.toFixed(2)}
+                  </dd>
+                </div>
+                <div className="flex justify-between">
+                  <dt className="text-gray-500">Delivery and Teardown</dt>
+                  <dd className="font-medium">
+                    ${deliveryFee.toFixed(2)}
+                  </dd>
+                </div>
+                <div className="flex justify-between">
+                  <dt className="text-gray-500">Service Charge (10%)</dt>
+                  <dd className="font-medium">
+                    ${serviceCharge.toFixed(2)}
+                  </dd>
+                </div>
+                <div className="flex justify-between">
+                  <dt className="text-gray-500">GST (9%)</dt>
+                  <dd className="font-medium">${gstAmount.toFixed(2)}</dd>
+                </div>
+                {/* <div className="flex justify-between border-t border-gray-200 pt-3 text-base font-bold">
+                  <dt>Total Payable</dt>
+                  <dd>${grandTotal.toFixed(2)}</dd>
+                </div> */}
 
                 {/* 6. Grand Total */}
                 <div className="border-t border-gray-200 pt-4">
